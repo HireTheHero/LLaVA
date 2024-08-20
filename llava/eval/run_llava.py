@@ -12,6 +12,10 @@ from llava.conversation import conv_templates, SeparatorStyle
 from llava.model.builder import load_pretrained_model
 from llava.utils import disable_torch_init
 from llava.mm_utils import (
+<<<<<<< HEAD
+=======
+    process_images,
+>>>>>>> 7775b12d6b20cd69089be7a18ea02615a59621cd
     tokenizer_image_token,
     get_model_name_from_path,
     KeywordsStoppingCriteria,
@@ -22,6 +26,12 @@ from PIL import Image
 import requests
 from PIL import Image
 from io import BytesIO
+import re
+
+
+def image_parser(args):
+    out = args.image_file.split(args.sep)
+    return out
 
 import re
 
@@ -36,6 +46,7 @@ def load_image(image_file):
 
 
 def load_images(image_files):
+<<<<<<< HEAD
     if type(image_files) is list:
         out = []
         for image_file in image_files:
@@ -58,6 +69,16 @@ def eval_model(
     args,
     sanitize_dict={"'": "__single_quote__", '"': "__double_quote__"},
 ):
+=======
+    out = []
+    for image_file in image_files:
+        image = load_image(image_file)
+        out.append(image)
+    return out
+
+
+def eval_model(args):
+>>>>>>> 7775b12d6b20cd69089be7a18ea02615a59621cd
     # Model
     disable_torch_init()
 
@@ -67,8 +88,11 @@ def eval_model(
     )
 
     qs = args.query
+<<<<<<< HEAD
     for ky in sanitize_dict.keys():
         qs = re.sub(sanitize_dict[ky], ky, qs)
+=======
+>>>>>>> 7775b12d6b20cd69089be7a18ea02615a59621cd
     image_token_se = DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN
     if IMAGE_PLACEHOLDER in qs:
         if model.config.mm_use_im_start_end:
@@ -105,12 +129,21 @@ def eval_model(
     prompt = conv.get_prompt()
 
     image_files = image_parser(args)
+<<<<<<< HEAD
     image = load_images(image_files)
     image_tensor = (
         image_processor.preprocess(image, return_tensors="pt")["pixel_values"]
         .half()
         .cuda()
     )
+=======
+    images = load_images(image_files)
+    images_tensor = process_images(
+        images,
+        image_processor,
+        model.config
+    ).to(model.device, dtype=torch.float16)
+>>>>>>> 7775b12d6b20cd69089be7a18ea02615a59621cd
 
     input_ids = (
         tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt")
@@ -125,17 +158,23 @@ def eval_model(
     with torch.inference_mode():
         outputs_all = model.generate(
             input_ids,
-            images=image_tensor,
-            do_sample=True,
-            temperature=0.2,
-            max_new_tokens=1024,
+            images=images_tensor,
+            do_sample=True if args.temperature > 0 else False,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            num_beams=args.num_beams,
+            max_new_tokens=args.max_new_tokens,
             use_cache=True,
             stopping_criteria=[stopping_criteria],
+<<<<<<< HEAD
             return_dict_in_generate=True,
             output_attentions=args.output_attentions,
             output_hidden_states=args.output_hidden_states,
         )
         output_ids = outputs_all["sequences"]
+=======
+        )
+>>>>>>> 7775b12d6b20cd69089be7a18ea02615a59621cd
 
     input_token_len = input_ids.shape[1]
     n_diff_input_output = (input_ids != output_ids[:, :input_token_len]).sum().item()
@@ -188,6 +227,7 @@ def eval_model(
     torch.cuda.empty_cache()
 
 
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-path", type=str, default="facebook/opt-350m")
@@ -195,11 +235,19 @@ if __name__ == "__main__":
     parser.add_argument("--image-file", type=str, required=True)
     parser.add_argument("--query", type=str, required=True)
     parser.add_argument("--conv-mode", type=str, default=None)
+<<<<<<< HEAD
     parser.add_argument("--output_attentions", action="store_true")
     parser.add_argument("--output_hidden_states", action="store_true")
     parser.add_argument("--sep", type=str, default="__sepsep__")
     parser.add_argument("--filename", type=str, default="Filename to be saved")
     parser.add_argument("--export_path", type=str, default="<file-export-path>")
+=======
+    parser.add_argument("--sep", type=str, default=",")
+    parser.add_argument("--temperature", type=float, default=0.2)
+    parser.add_argument("--top_p", type=float, default=None)
+    parser.add_argument("--num_beams", type=int, default=1)
+    parser.add_argument("--max_new_tokens", type=int, default=512)
+>>>>>>> 7775b12d6b20cd69089be7a18ea02615a59621cd
     args = parser.parse_args()
 
     eval_model(args)

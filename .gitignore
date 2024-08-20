@@ -30,3 +30,9 @@ ckpts*
 
 .ipynb_checkpoints
 *.ipynb
+
+# DevContainer
+!.devcontainer/*
+
+# Demo
+serve_images/
