@@ -9,6 +9,7 @@ def get_args():
     parser.add_argument("--result-dir", type=str, required=True)
     parser.add_argument("--upload-dir", type=str, required=True)
     parser.add_argument("--experiment", type=str, required=True)
+    parser.add_argument('--sep', type=str, default="__sep__")
 
     return parser.parse_args()
 
@@ -16,12 +17,14 @@ if __name__ == "__main__":
     args = get_args()
 
     df = pd.read_table(args.annotation_file)
+    df['index'] = df['index'].astype(str).apply(lambda x: int(x.split(args.sep)[-1]))
 
     cur_df = df.copy()
     cur_df = cur_df.drop(columns=['hint', 'category', 'source', 'image', 'comment', 'l2-category'])
     cur_df.insert(6, 'prediction', None)
     for pred in open(os.path.join(args.result_dir, f"{args.experiment}.jsonl")):
         pred = json.loads(pred)
+        pred['question_id'] = int(str(pred['question_id']).split(args.sep)[-1])
         cur_df.loc[df['index'] == pred['question_id'], 'prediction'] = pred['text']
 
     cur_df.to_excel(os.path.join(args.upload_dir, f"{args.experiment}.xlsx"), index=False, engine='openpyxl')

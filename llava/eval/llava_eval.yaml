@@ -1,0 +1,49 @@
+# LLaVA eval config
+root_path: /home/s2140401/script/memes_xai/models/LLaVA/playground/data/eval
+GQA:
+  prefix: gqa
+  questions: llava_gqa_testdev_balanced.jsonl
+  text_col: text
+  image_col: image
+  id_col: question_id
+  eval_type: model_vqa_loader
+  image_folder: eval/gqa/data/images
+MM-Vet:
+  prefix: mm-vet
+  questions: llava-mm-vet.jsonl
+  text_col: text
+  image_col: image
+  id_col: question_id
+  eval_type: model_vqa
+  image_folder: eval/mm-vet/images
+MMBench:
+  prefix: mmbench
+  questions: mmbench_dev_20230712.tsv
+  text_col: question
+  image_col: image
+  id_col: index
+  eval_type: model_vqa_mmbench
+TextVQA:
+  prefix: textvqa
+  questions: llava_textvqa_val_v051_ocr.jsonl
+  text_col: text
+  image_col: image
+  id_col: question_id
+  eval_type: model_vqa_loader
+  image_folder: eval/textvqa/train_images
+VizWiz:
+  prefix: vizwiz
+  questions: llava_test.jsonl
+  text_col: text
+  image_col: image
+  id_col: question_id
+  eval_type: model_vqa_loader
+  image_folder: eval/vizwiz/test
+VQAv2:
+  prefix: vqav2
+  questions: llava_vqav2_mscoco_test-dev2015.jsonl
+  text_col: text
+  image_col: image
+  id_col: question_id
+  eval_type: model_vqa_loader
+  image_folder: eval/vqav2/test2015

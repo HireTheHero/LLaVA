@@ -10,6 +10,7 @@ def parse_args():
     parser.add_argument('--dir', type=str, default="./playground/data/eval/vqav2")
     parser.add_argument('--ckpt', type=str, required=True)
     parser.add_argument('--split', type=str, required=True)
+    parser.add_argument('--sep', type=str, default="__sep__")
     return parser.parse_args()
 
 
@@ -30,7 +31,7 @@ if __name__ == '__main__':
         except:
             error_line += 1
 
-    results = {x['question_id']: x['text'] for x in results}
+    results = {int(str(x['question_id']).split(args.sep)[-1]): x['text'] for x in results}
     test_split = [json.loads(line) for line in open(test_split)]
     split_ids = set([x['question_id'] for x in test_split])
 
