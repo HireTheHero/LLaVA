@@ -239,6 +239,8 @@ class CustomModelConfig:
     text_model: str = "meta-llama/Llama-2-13b-chat-hf"
     # n_epochs: int = 4
     # n_epochs: int = 1000
+    seq_len_in: int = 200
+    seq_len_out: int = 20
     n_epochs: int = 500
     embed_dim: int = 5120
     num_heads: int = 8
@@ -298,7 +300,9 @@ class MixedEffectModel(nn.Module):
         # print(f"w_fixed.shape: {w_fixed.shape}")
         w_fixed = self.format2batched(w_fixed)
         # print(f"w_fixed.shape: {w_fixed.shape}")
-        w_fixed = repeat(w_fixed, 'n d2 -> n d1 d2', d1=x_random.shape[1])
+        if x_random.dim() == 3:
+            # If x_random is 3D, repeat w_fixed to match the first dimension
+            w_fixed = repeat(w_fixed, 'n d2 -> n d1 d2', d1=x_random.shape[1])        
         # print(f"w_fixed.shape: {w_fixed.shape}")
         x_fixed = x_random * w_fixed
         # print(f"x_fixed.shape: {x_fixed.shape}")
@@ -327,6 +331,117 @@ class RandomEffectModel(nn.Module):
         # print(f"x.shape: {x.shape}")
         x_random = self.fnn(x)
         return x_random
+
+
+class MixedEffectProbe(nn.Module):
+    def __init__(
+        self,
+        input_dim, output_dim,
+        num_categories, hidden_dim,
+        seq_len_in, seq_len_out
+    ):
+        super().__init__()
+        self.fnn = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, output_dim),
+        )
+        self.embedding  = nn.Embedding(num_categories, output_dim)
+        self.seq_weight = nn.Parameter(torch.randn(seq_len_out, seq_len_in))
+
+    def forward(
+        self,
+        x,                  # [B, L_in, input_dim]
+        z,                  # [B] or [L_in]
+        input_lengths,      # [B]
+        output_lengths      # [B]
+    ):
+        B, L_in, _ = x.shape
+        L_out     = self.seq_weight.size(0)
+        device    = x.device
+
+        # random effects
+        x_random = self.fnn(x)       # [B, L_in, D]
+
+        # fixed effects
+        w_fixed = self.embedding(z)
+        if w_fixed.dim() == 2:       # [B, D]
+            w_fixed = repeat(w_fixed, 'b d -> b l d', l=L_in)
+        x_fixed = x_random * w_fixed  # [B, L_in, D]
+
+        interaction = x_random * x_fixed
+        x_combined  = x_random + interaction  # [B, L_in, D]
+
+        # build masks
+        input_mask = (
+            torch.arange(L_in, device=device)
+                .unsqueeze(0).expand(B, L_in)
+                .lt(input_lengths.unsqueeze(1))
+        )  # [B, L_in]
+        output_mask = (
+            torch.arange(L_out, device=device)
+                .unsqueeze(0).expand(B, L_out)
+                .lt(output_lengths.unsqueeze(1))
+        )  # [B, L_out]
+
+        # zero out any padded input timesteps
+        x_combined = x_combined * input_mask.unsqueeze(-1).float()
+
+        # project time‐axis L_in → L_out
+        x_out = torch.einsum('bld,ol->bod', x_combined, self.seq_weight)
+
+        # zero out any padded output slots
+        x_out = x_out * output_mask.unsqueeze(-1).float()
+
+        return x_out
+
+
+class RandomEffectProbe(nn.Module):
+    def __init__(
+        self,
+        input_dim, output_dim, hidden_dim,
+        seq_len_in, seq_len_out
+    ):
+        super().__init__()
+        self.fnn        = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, output_dim),
+        )
+        self.seq_weight = nn.Parameter(torch.randn(seq_len_out, seq_len_in))
+
+    def forward(
+        self,
+        x,                # [B, L_in, input_dim]
+        input_lengths,    # [B]
+        output_lengths    # [B]
+    ):
+        B, L_in, _ = x.shape
+        L_out     = self.seq_weight.size(0)
+        device    = x.device
+
+        x_random = self.fnn(x)  # [B, L_in, D]
+
+        # mask inputs
+        input_mask = (
+            torch.arange(L_in, device=device)
+                .unsqueeze(0).expand(B, L_in)
+                .lt(input_lengths.unsqueeze(1))
+        )
+        x_random = x_random * input_mask.unsqueeze(-1).float()
+
+        # project
+        x_out = torch.einsum('bld,ol->bod', x_random, self.seq_weight)
+
+        # mask outputs
+        output_mask = (
+            torch.arange(L_out, device=device)
+                .unsqueeze(0).expand(B, L_out)
+                .lt(output_lengths.unsqueeze(1))
+        )
+        x_out = x_out * output_mask.unsqueeze(-1).float()
+
+        return x_out
 
 
 def load_objects(

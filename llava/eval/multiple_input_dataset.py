@@ -39,10 +39,12 @@ from transformers.models.clip.modeling_clip import CLIPModel as CLIPModelClass
 from transformers.models.clip.processing_clip import CLIPProcessor as CLIPProcessorClass
 
 from utils import get_module_logger
+
 try:
     from llava.constants import DEFAULT_IMAGE_TOKEN
 except Exception as e:
     from constants import DEFAULT_IMAGE_TOKEN
+
 
 def arg_parser():
     parser = argparse.ArgumentParser()
@@ -78,7 +80,12 @@ def arg_parser():
         "--clip-model", type=str, default="openai/clip-vit-large-patch14"
     )
     parser.add_argument("--debug", action="store_true", help="debug mode")
-    parser.add_argument("--prefix", type=str, help="Prefix for output file", default="multiple_inputs_")
+    parser.add_argument(
+        "--prefix", type=str, help="Prefix for output file", default="multiple_inputs_"
+    )
+    parser.add_argument(
+        "--sim-method", type=str, default="cosine", help="Similarity method"
+    )
     args = parser.parse_args()
     return args
 
@@ -97,7 +104,12 @@ def get_chunk(lst, n, k):
 def preprocess_dataset(
     args: Namespace,
     df: pd.DataFrame,
-    col_dict: Dict[str, str] = {"id": "id", "text": "first_question", "image": "image", "answer": "first_answer"},
+    col_dict: Dict[str, str] = {
+        "id": "id",
+        "text": "first_question",
+        "image": "image",
+        "answer": "first_answer",
+    },
 ) -> Dict[str, List[str]]:
     out = {}
     for ky in col_dict.keys():
@@ -118,25 +130,24 @@ def load_dataset(args: Namespace, logger: Logger) -> pd.DataFrame:
         raise NotImplementedError
     if args.debug:
         org_data = org_data.head(69)
-    org_data["answer"] = ""# initialize answer column
+    org_data["answer"] = ""  # initialize answer column
     logger.info(f"Loaded {len(org_data)} questions from {data_path}")
     col_dict = {
         "id": config[args.task]["id_col"],
         "text": config[args.task]["text_col"],
-        "answer": "answer",# initialized column
+        "answer": "answer",  # initialized column
         "image": config[args.task]["image_col"],
     }
     questions = preprocess_dataset(args, org_data, col_dict)
     return org_data, questions, config, col_dict
 
 
-def load_objects(
-    args: Namespace
-) -> Tuple[CLIPModelClass, CLIPProcessorClass]:
+def load_objects(args: Namespace) -> Tuple[CLIPModelClass, CLIPProcessorClass]:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     processor = CLIPProcessor.from_pretrained(args.clip_model)
     model = CLIPModel.from_pretrained(args.clip_model).to(device)
     return model, processor, device
+
 
 def model_pair(
     texts: List[str],
@@ -144,34 +155,50 @@ def model_pair(
     model: CLIPModelClass,
     processor: CLIPProcessorClass,
     device: torch.device,
+    sim_method: str = "cosine",
 ) -> Tensor:
     """
     Model (text, image) by CLIP
     """
-    model_inputs = processor(
-        text=texts, images=images, return_tensors="pt", padding=True, truncation = True
-    ).to(device)
-    model.eval()
-    with torch.no_grad():
-        outputs = model(**model_inputs)
-    reprs_t, reprs_v = (
-        outputs.text_embeds.to("cpu"),
-        outputs.image_embeds.to("cpu"),
-    )
-    return torch.cat((reprs_t, reprs_v), dim=1)
+    if sim_method == "random":
+        # dummy
+        out = torch.full((len(images), 100), -1)
+    else:
+        model_inputs = processor(
+            text=texts,
+            images=images,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+        ).to(device)
+        model.eval()
+        with torch.no_grad():
+            outputs = model(**model_inputs)
+        reprs_t, reprs_v = (
+            outputs.text_embeds.to("cpu"),
+            outputs.image_embeds.to("cpu"),
+        )
+        out = torch.cat((reprs_t, reprs_v), dim=1)
+    return out
 
 
 def load_image(image_file, args, ds_type, config):
-    if ds_type == "reference":
+    if args.sim_method == "random":
+        image = "dummy"
+    elif ds_type == "reference":
         image_file = f"{args.train_path}/{image_file}"
         image = Image.open(image_file).convert("RGB")
-    elif ds_type =="model_vqa_loader":
-        image_file = f"{args.train_path}/{config[args.task]['image_folder']}/{image_file}"
+    elif ds_type == "model_vqa_loader":
+        image_file = (
+            f"{args.train_path}/{config[args.task]['image_folder']}/{image_file}"
+        )
         image = Image.open(image_file).convert("RGB")
     elif ds_type == "model_vqa_mmbench":
         image = Image.open(BytesIO(base64.b64decode(image_file)))
     elif ds_type == "model_vqa":
-        image_file = f"{args.train_path}/{config[args.task]['image_folder']}/{image_file}"
+        image_file = (
+            f"{args.train_path}/{config[args.task]['image_folder']}/{image_file}"
+        )
         image = Image.open(image_file)
     else:
         raise NotImplementedError
@@ -187,9 +214,7 @@ def load_images(image_files, args, ds_type, config):
 
 
 def model_dataset(
-    objects: List[
-        Union[CLIPProcessorClass, CLIPModelClass]
-    ],
+    objects: List[Union[CLIPProcessorClass, CLIPModelClass]],
     dataset: Dict[str, List[Any]],
     args: Namespace,
     ds_type: str,
@@ -202,22 +227,26 @@ def model_dataset(
     pair_reprs = []
     for t_batch, i_batch in tqdm(zip(dataset["text"], dataset["image"])):
         i_batch = load_images(i_batch, args, ds_type, config)
-        pair_repr = model_pair(t_batch, i_batch, model, processor, device)
+        pair_repr = model_pair(
+            t_batch, i_batch, model, processor, device, sim_method=args.sim_method
+        )
         pair_reprs.append(pair_repr)
     return pair_reprs
 
 
-def calculate_similarity(repr1: Tensor, repr2: Tensor, method="cosine") -> Tensor:
-    """
-    Calculate similarity of two representations
-    """
-    if method == "cosine":
-        sims = F.cosine_similarity(repr1, repr2, dim=0)
-    elif method == "l2":
-        sims = torch.norm(repr1 - repr2, dim=0)
-    else:
-        raise NotImplementedError
-    return sims
+# def calculate_similarity(repr1: Tensor, repr2: Tensor, method="cosine") -> Tensor:
+#     """
+#     Calculate similarity of two representations
+#     """
+#     if method == "cosine":
+#         sims = F.cosine_similarity(repr1, repr2, dim=0)
+#     elif method == "l2":
+#         sims = torch.norm(repr1 - repr2, dim=0)
+#     elif method == "random":
+#         sims = torch.rand(repr1.shape[0])
+#     else:
+#         raise NotImplementedError
+#     return sims
 
 
 def load_reference_dataset(
@@ -231,7 +260,9 @@ def load_reference_dataset(
     else:
         train = train[train["source"] == "coco"].reset_index(drop=True)
     train["first_question"] = train["conversations"].apply(lambda x: x[0]["value"])
-    train["first_question"] = train["first_question"].apply(lambda x: re.sub(DEFAULT_IMAGE_TOKEN, "", x))
+    train["first_question"] = train["first_question"].apply(
+        lambda x: re.sub(DEFAULT_IMAGE_TOKEN, "", x)
+    )
     train["first_answer"] = train["conversations"].apply(lambda x: x[1]["value"])
     if args.debug:
         train = train.head(79)
@@ -259,27 +290,34 @@ def model_datasets(
     """
     objects = load_objects(args)
     logger.info(f"Loaded CLIP model {args.clip_model}")
-    q_reprs = model_dataset(objects, query, args, config[args.task]["eval_type"], config)
+    q_reprs = model_dataset(
+        objects, query, args, config[args.task]["eval_type"], config
+    )
     r_reprs = model_dataset(objects, reference, args, "reference")
     return q_reprs, r_reprs
 
 
 def calculate_similarity(A, B, method="cosine", params=None):
-    A_norm = F.normalize(A, p=2, dim=1)
-    B_norm = F.normalize(B, p=2, dim=1)
-    if method == "cosine":
-        out = torch.mm(A, B.t())
-    elif method == "rbf":
-        params = params or {"gamma": 1}
-        euclidean_distance = torch.cdist(A_norm, B_norm)
-        out = torch.exp(-params["gamma"] * euclidean_distance**2)
+    if method == "random":
+        out = torch.rand(A.shape[0], B.shape[0])
     else:
-        raise NotImplementedError
+        A_norm = F.normalize(A, p=2, dim=1)
+        B_norm = F.normalize(B, p=2, dim=1)
+        if method == "cosine":
+            out = torch.mm(A, B.t())
+        elif method == "rbf":
+            params = params or {"gamma": 1}
+            euclidean_distance = torch.cdist(A_norm, B_norm)
+            out = torch.exp(-params["gamma"] * euclidean_distance**2)
+        else:
+            raise NotImplementedError
     return out
+
 
 def extract_most_similar_col(similarity, val_arr):
     _, sim_max_idx = torch.max(similarity, dim=1)
     return val_arr[sim_max_idx.numpy()].astype(str)
+
 
 def extract_most_similar_cols(similarity, data, col_dict):
     out = {}
@@ -287,11 +325,15 @@ def extract_most_similar_cols(similarity, data, col_dict):
         out[ky] = extract_most_similar_col(similarity, data[col_dict[ky]].to_numpy())
     return out
 
+
 def extract_most_similar_reference(similarity, reference, col_dict):
     most_similar_reference = {}
     for ky in col_dict.keys():
-        most_similar_reference[ky] = extract_most_similar_col(similarity, reference[col_dict[ky]].to_numpy())
+        most_similar_reference[ky] = extract_most_similar_col(
+            similarity, reference[col_dict[ky]].to_numpy()
+        )
     return most_similar_reference
+
 
 def insert_reference(org_data, reference, org_col_dict, sep="__sep__"):
     out = org_data.copy()
@@ -300,40 +342,44 @@ def insert_reference(org_data, reference, org_col_dict, sep="__sep__"):
         export_series = pd.Series(reference[ky].astype(str))
         org_series = out[org_col].astype(str)
         if max(org_series.str.len()) > 0:
-            export_series = export_series+sep
+            export_series = export_series + sep
         else:
             pass
-        export_series = export_series+org_series
+        export_series = export_series + org_series
         out[org_col] = export_series.copy()
     return out
 
+
 def create_dataset_with_reference(
-    args, 
-    org_col_dict, 
-    org_data, 
-    org_reference, 
-    q_reprs, 
+    args,
+    org_col_dict,
+    org_data,
+    org_reference,
+    q_reprs,
     r_reprs,
-    ref_col_dict = {
-        "id": "id", 
-        "text": "first_question", 
-        "answer": "first_answer", 
+    ref_col_dict={
+        "id": "id",
+        "text": "first_question",
+        "answer": "first_answer",
         "image": "image",
     },
 ):
-    '''
+    """
     Create a dataset with reference input
-    '''
+    """
     q_reprs, r_reprs = torch.cat(q_reprs, dim=0), torch.cat(r_reprs, dim=0)
-    similarity = calculate_similarity(q_reprs, r_reprs, method="cosine")
-    most_similar_reference = extract_most_similar_reference(similarity, org_reference, ref_col_dict)
+    similarity = calculate_similarity(q_reprs, r_reprs, method=args.sim_method)
+    most_similar_reference = extract_most_similar_reference(
+        similarity, org_reference, ref_col_dict
+    )
     data_w_reference = insert_reference(org_data, most_similar_reference, org_col_dict)
     return data_w_reference
 
+
 def save_dataset(args, config, data_w_reference):
-    '''
+    """
     Save a dataset with reference input
-    '''
+    """
     data_path = f"{config['root_path']}/{config[args.task]['prefix']}/{args.prefix}{config[args.task]['questions']}"
     assert not os.path.isfile(data_path), f"File {data_path} already exists"
     if data_path.endswith(".tsv"):
@@ -344,19 +390,24 @@ def save_dataset(args, config, data_w_reference):
         raise NotImplementedError
     return data_path
 
+
 if __name__ == "__main__":
     args = arg_parser()
     logger = get_module_logger()
     assert os.path.isfile(f"{args.train_path}/llava_v1_5_mix665k.json")
     org_data, dataset, config, col_dict = load_dataset(args, logger)
-    logger.info(f"Dataset: loaded {len(dataset['image'])} batches w/ roughly {len(dataset['image'][0])} elements each")
+    logger.info(
+        f"Dataset: loaded {len(dataset['image'])} batches w/ roughly {len(dataset['image'][0])} elements each"
+    )
     org_reference, reference = get_reference(args, logger)
     logger.info(
         f"Reference: Converted to {len(reference['image'])} batches w/ roughly {len(reference['image'][0])} elements each"
     )
     q_reprs, r_reprs = model_datasets(args, logger, reference, dataset, config)
     logger.info(f"Modelled {len(q_reprs), len(r_reprs)} questions")
-    data_w_reference = create_dataset_with_reference(args, col_dict, org_data, org_reference, q_reprs, r_reprs)
+    data_w_reference = create_dataset_with_reference(
+        args, col_dict, org_data, org_reference, q_reprs, r_reprs
+    )
     logger.info(f"Created #{len(data_w_reference)} dataset with reference")
     saved_path = save_dataset(args, config, data_w_reference)
     logger.info(f"Saved dataset with reference to {saved_path}")
