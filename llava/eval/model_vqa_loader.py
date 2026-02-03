@@ -71,10 +71,20 @@ class CustomDataset(Dataset):
 
 
 # DataLoader
-def create_data_loader(questions1, questions2, image_folder, tokenizer, image_processor, model_config, batch_size=1, num_workers=4):
+def create_data_loader(questions1, questions2, image_folder, tokenizer, image_processor, model_config, batch_size=1, num_workers=4, pin_memory=False, prefetch_factor=None, persistent_workers=False):
     assert batch_size == 1, "batch_size must be 1"
     dataset = CustomDataset(questions1, questions2, image_folder, tokenizer, image_processor, model_config)
-    data_loader = DataLoader(dataset, batch_size=batch_size, num_workers=num_workers, shuffle=False)
+    loader_kwargs = {
+        "batch_size": batch_size,
+        "num_workers": num_workers,
+        "shuffle": False,
+        "pin_memory": pin_memory,
+    }
+    if num_workers > 0:
+        loader_kwargs["persistent_workers"] = persistent_workers
+        if prefetch_factor is not None:
+            loader_kwargs["prefetch_factor"] = prefetch_factor
+    data_loader = DataLoader(dataset, **loader_kwargs)
     return data_loader
 
 
@@ -82,6 +92,16 @@ def get_chunk_from_file(question_file, args):
     questions = [json.loads(q) for q in open(os.path.expanduser(question_file), "r")]
     questions = get_chunk(questions, args.num_chunks, args.chunk_idx)
     return questions
+
+
+def item_outputs_exist(extract_path, index, question_id1, question_id2):
+    expected_files = [
+        f"reprs1_{index}_{question_id1}.pt.gz",
+        f"reprs2_{index}_{question_id2}.pt.gz",
+        f"output_texts1_{index}_{question_id1}.pkl",
+        f"output_texts2_{index}_{question_id2}.pkl",
+    ]
+    return all(os.path.exists(os.path.join(extract_path, filename)) for filename in expected_files)
 
 
 def generate_ids_reprs(image_tensor, input_ids, line, args, model, tokenizer, device, model_dtype, model_name):
@@ -100,7 +120,7 @@ def generate_ids_reprs(image_tensor, input_ids, line, args, model, tokenizer, de
             temperature=args.temperature,
             top_p=args.top_p,
             num_beams=args.num_beams,
-            max_new_tokens=128,
+            max_new_tokens=args.max_new_tokens,
             output_attentions=args.output_attentions,
             output_hidden_states=args.output_hidden_states,
             return_dict_in_generate=True,
@@ -140,14 +160,33 @@ def eval_model(args):
     makedirs_recursive(args.extract_path)
     random.seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model_dtype = torch.float32 if not torch.cuda.is_available() else torch.float16
+    if device.type != "cuda":
+        model_dtype = torch.float32
+    else:
+        if args.model_dtype == "fp32":
+            model_dtype = torch.float32
+        elif args.model_dtype == "bf16":
+            model_dtype = torch.bfloat16
+        else:
+            model_dtype = torch.float16
     disable_torch_init()
+    if args.tf32 and device.type == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = True
+        try:
+            torch.set_float32_matmul_precision("high")
+        except AttributeError:
+            pass
     question_file1, question_file2 = parse_filenames(args.question_file)
     answers_file1, answers_file2 = parse_filenames(args.answers_file)
     model_path = os.path.expanduser(args.model_path)
     model_name = get_model_name_from_path(model_path)
     tokenizer, model, image_processor, context_len = load_pretrained_model(model_path, args.model_base, model_name, device=device)
     model = model.to(device=device, dtype=model_dtype)
+    if args.torch_compile:
+        try:
+            model = torch.compile(model)
+        except Exception as exc:
+            print(f"[Warning] torch.compile failed, continuing without compile: {exc}")
 
     questions1 = get_chunk_from_file(question_file1, args)
     questions2 = get_chunk_from_file(question_file2, args)
@@ -156,15 +195,26 @@ def eval_model(args):
     answers_file2 = os.path.expanduser(answers_file2)
     os.makedirs(os.path.dirname(answers_file1), exist_ok=True)
     os.makedirs(os.path.dirname(answers_file2), exist_ok=True)
-    ans_file1 = open(answers_file1, "w")
-    ans_file2 = open(answers_file2, "w")
+    answers_mode = "a" if args.skip_existing else "w"
+    ans_file1 = open(answers_file1, answers_mode)
+    ans_file2 = open(answers_file2, answers_mode)
 
     if 'plain' in model_name and 'finetune' not in model_name.lower() and 'mmtag' not in args.conv_mode:
         args.conv_mode = args.conv_mode + '_mmtag'
         print(f'It seems that this is a plain model, but it is not using a mmtag prompt, auto switching to {args.conv_mode}.')
 
-<<<<<<< HEAD
-    data_loader = create_data_loader(questions1, questions2, args.image_folder, tokenizer, image_processor, model.config)
+    data_loader = create_data_loader(
+        questions1,
+        questions2,
+        args.image_folder,
+        tokenizer,
+        image_processor,
+        model.config,
+        num_workers=args.num_workers,
+        pin_memory=args.pin_memory,
+        prefetch_factor=args.prefetch_factor,
+        persistent_workers=args.persistent_workers,
+    )
 
     assert len(questions1) == len(questions2), "questions1 and questions2 must have the same length"
     # cnt = 0
@@ -176,7 +226,14 @@ def eval_model(args):
     else:
         # all iteration
         selected_iterations = range(len(questions1))
+    skipped_existing = False
     for i, ((input_ids1, image_tensor1, input_ids2, image_tensor2), line1, line2) in enumerate(tqdm(zip(data_loader, questions1, questions2), total=len(questions1))):
+        question_id1 = line1["question_id"]
+        question_id2 = line2["question_id"]
+        if (not args.do_repr_sample or i in selected_iterations) and args.skip_existing:
+            if item_outputs_exist(args.extract_path, i, question_id1, question_id2):
+                skipped_existing = True
+                continue
         ans_dict1, repr1 = generate_ids_reprs(image_tensor1, input_ids1, line1, args, model, tokenizer, device, model_dtype, model_name)
         ans_dict2, repr2 = generate_ids_reprs(image_tensor2, input_ids2, line2, args, model, tokenizer, device, model_dtype, model_name)
         if not args.do_repr_sample or i in selected_iterations:
@@ -208,48 +265,11 @@ def eval_model(args):
 
     del model
     torch.cuda.empty_cache()
-    if args.load_repr_sample:
+    if args.load_repr_sample or skipped_existing:
         reprs1 = reprs2 = output_texts1 = output_texts2 = args.extract_path
     repr_model = learn_repr(args, reprs1, reprs2, output_texts1, output_texts2)
     ans_file1.close()
     ans_file2.close()
-=======
-    data_loader = create_data_loader(questions, args.image_folder, tokenizer, image_processor, model.config)
-
-    for (input_ids, image_tensor), line in tqdm(zip(data_loader, questions), total=len(questions)):
-        idx = line["question_id"]
-        cur_prompt = line["text"]
-
-        input_ids = input_ids.to(device='cuda', non_blocking=True)
-
-        with torch.inference_mode():
-            output_ids = model.generate(
-                input_ids,
-                images=image_tensor.to(dtype=torch.float16, device='cuda', non_blocking=True),
-                do_sample=True if args.temperature > 0 else False,
-                temperature=args.temperature,
-                top_p=args.top_p,
-                num_beams=args.num_beams,
-                max_new_tokens=args.max_new_tokens,
-                use_cache=True)
-
-        input_token_len = input_ids.shape[1]
-        n_diff_input_output = (input_ids != output_ids[:, :input_token_len]).sum().item()
-        if n_diff_input_output > 0:
-            print(f'[Warning] {n_diff_input_output} output_ids are not the same as the input_ids')
-        outputs = tokenizer.batch_decode(output_ids[:, input_token_len:], skip_special_tokens=True)[0]
-        outputs = outputs.strip()
-
-        ans_id = shortuuid.uuid()
-        ans_file.write(json.dumps({"question_id": idx,
-                                   "prompt": cur_prompt,
-                                   "text": outputs,
-                                   "answer_id": ans_id,
-                                   "model_id": model_name,
-                                   "metadata": {}}) + "\n")
-        # ans_file.flush()
-    ans_file.close()
->>>>>>> 7775b12d6b20cd69089be7a18ea02615a59621cd
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -264,7 +284,7 @@ if __name__ == "__main__":
     parser.add_argument("--temperature", type=float, default=0.2)
     parser.add_argument("--top_p", type=float, default=None)
     parser.add_argument("--num_beams", type=int, default=1)
-<<<<<<< HEAD
+    parser.add_argument("--max-new-tokens", type=int, default=128)
     parser.add_argument("--sep", type=str, default="__sep__")
     parser.add_argument("--train-path", type=str, default="path/to/train/data")
     parser.add_argument("--output-attentions", action="store_true")
@@ -276,9 +296,15 @@ if __name__ == "__main__":
     parser.add_argument("--do-repr-sample", action="store_true")
     parser.add_argument("--repr-sample-num", type=int, default=4000)
     parser.add_argument("--load-repr-sample", action="store_true")
-=======
-    parser.add_argument("--max_new_tokens", type=int, default=128)
->>>>>>> 7775b12d6b20cd69089be7a18ea02615a59621cd
+    parser.add_argument("--skip-existing", dest="skip_existing", action="store_true", default=True)
+    parser.add_argument("--no-skip-existing", dest="skip_existing", action="store_false")
+    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--pin-memory", action="store_true")
+    parser.add_argument("--prefetch-factor", type=int, default=None)
+    parser.add_argument("--persistent-workers", action="store_true")
+    parser.add_argument("--model-dtype", choices=["fp16", "bf16", "fp32"], default="fp16")
+    parser.add_argument("--tf32", action="store_true")
+    parser.add_argument("--torch-compile", action="store_true")
     args = parser.parse_args()
 
     eval_model(args)
