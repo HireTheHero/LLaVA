@@ -1,6 +1,7 @@
 # from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
+import time
 import gzip
 import itertools
 # import math
@@ -447,8 +448,11 @@ def train_loop(args, objects, train_dataloader, logger=None):
     contrastive_model.train()
     # text_model.eval()
     best_loss = None
+    log_every = getattr(args, "log_progress_every", None)
     for epoch in range(n_epochs):
         total_loss = 0.0
+        epoch_start = time.time()
+        total_steps = len(train_dataloader)
         for i, batch in enumerate(train_dataloader):
             query_embed, target_embed, query_text, _, fixed_effect_idx = batch
             query_embed = query_embed.to(device=device, dtype=dtype4model)
@@ -475,6 +479,14 @@ def train_loop(args, objects, train_dataloader, logger=None):
             del output
             # process = psutil.Process()
             # log_or_print(f"Memory used in train loop: {process.memory_info().rss}", logger)
+            log_progress(
+                f"Train epoch {epoch + 1}/{n_epochs}",
+                i + 1,
+                total_steps,
+                epoch_start,
+                log_every,
+                logger,
+            )
         log_or_print(f"Epoch [{epoch+1}/{n_epochs}], Loss: {total_loss}", logger)
         process = psutil.Process()
         log_or_print(f"Memory used in train loop: {process.memory_info().rss}", logger)
@@ -547,9 +559,12 @@ def eval_loop(args, objects, test_data, is_category_wise_eval=False, logger=None
     else:
         log_or_print("Sample-wise evaluation", logger)
         outputs = {"query_target": [], "score_target": [], "answers": [], "fixed_effect_idx": []}
+    log_every = getattr(args, "log_progress_every", None)
     with torch.no_grad():
         if is_category_wise_eval:
-            for entry in tqdm(test_data):
+            eval_start = time.time()
+            total_steps = len(test_data)
+            for entry_idx, entry in enumerate(tqdm(test_data), start=1):
                 for ct in entry.keys():
                     entry_ct = entry[ct]
                     if not entry_ct:
@@ -603,9 +618,19 @@ def eval_loop(args, objects, test_data, is_category_wise_eval=False, logger=None
                         outputs[f"{ct}_score_target"].append(dist_score_tgt)
                         outputs[f"{ct}_answers"].append(dist_ans)
                         outputs[f"{ct}_loss"].append(loss.item())
+                log_progress(
+                    "Eval category-wise",
+                    entry_idx,
+                    total_steps,
+                    eval_start,
+                    log_every,
+                    logger,
+                )
 
         else:
-            for batch in tqdm(test_data):
+            eval_start = time.time()
+            total_steps = len(test_data)
+            for batch_idx, batch in enumerate(tqdm(test_data), start=1):
                 query_embed, target_embed, query_text, target_text, fixed_effect_idx = batch
                 query_embed = query_embed.to(device=device, dtype=dtype4model)
                 target_embed = target_embed.to(device=device, dtype=dtype4model)
@@ -641,6 +666,14 @@ def eval_loop(args, objects, test_data, is_category_wise_eval=False, logger=None
                     target_embed.reshape(target_embed.shape[0], -1),
                 )
                 losses.append(loss.item())
+                log_progress(
+                    "Eval sample-wise",
+                    batch_idx,
+                    total_steps,
+                    eval_start,
+                    log_every,
+                    logger,
+                )
     if is_category_wise_eval:
         pass
     else:
@@ -749,6 +782,23 @@ def log_or_print(msg, logger=None):
     else:
         print(msg)
     return
+
+
+def log_progress(phase, step, total, start_time, log_every, logger=None):
+    if not total or not log_every or log_every <= 0:
+        return
+    if step % log_every != 0 and step != total:
+        return
+    elapsed = time.time() - start_time
+    rate = step / elapsed if elapsed > 0 else 0.0
+    remaining = total - step
+    eta_seconds = remaining / rate if rate > 0 else 0.0
+    percent = (step / total) * 100
+    log_or_print(
+        f"{phase}: {step}/{total} ({percent:.1f}%) "
+        f"elapsed={elapsed:.0f}s eta={eta_seconds:.0f}s",
+        logger,
+    )
 
 
 def load_files_or_objects_w_substr(
