@@ -190,6 +190,7 @@ def create_data_loader(
     query_text,
     target_text,
     fixed_effect_indices_and_mapping=None,
+    batch_size_override=None,
     is_category_wise_eval=False,
     custom_collate=None,
     logger=None,
@@ -203,7 +204,7 @@ def create_data_loader(
     else:
         fixed_effect_indices = None
     config = CustomDatasetConfig()
-    batch_size = config.batch_size
+    batch_size = batch_size_override if batch_size_override is not None else config.batch_size
     # query_embed_batched = split_list(query_embed, batch_size)
     dataset = CustomDataset(
         query_embed,
@@ -444,7 +445,7 @@ def train_loop(args, objects, train_dataloader, logger=None):
         _,
         _,
     ) = objects
-    n_epochs = config.n_epochs
+    n_epochs = getattr(args, "repr_num_epochs", config.n_epochs)
     contrastive_model.train()
     # text_model.eval()
     best_loss = None
@@ -875,7 +876,12 @@ def learn_repr(args, query_embed, target_embed, query_text, target_text, logger=
     #     print(f"Labels: {Counter(labels)}")
     set_seed(args.seed)
     train_dataloader, test_dataloader = create_data_loader(
-        query_embed, target_embed, query_text, target_text, None
+        query_embed,
+        target_embed,
+        query_text,
+        target_text,
+        None,
+        batch_size_override=getattr(args, "repr_batch_size", None),
     )
     log_or_print(
         f"Dataset created with size: {len(train_dataloader.dataset), len(test_dataloader.dataset)}",
@@ -1046,6 +1052,7 @@ def learn_repr_tasks(args, logger=None, is_category_wise_eval=False):
         query_text, 
         target_text, 
         fixed_effect_indices_and_mapping=[objects[-2], objects[-1]], 
+        batch_size_override=getattr(args, "repr_batch_size", None),
         is_category_wise_eval=is_category_wise_eval,
         custom_collate=None,
         logger=logger,

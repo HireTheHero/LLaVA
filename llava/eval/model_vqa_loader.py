@@ -300,6 +300,8 @@ if __name__ == "__main__":
     parser.add_argument("--do-repr-sample", action="store_true")
     parser.add_argument("--repr-sample-num", type=int, default=4000)
     parser.add_argument("--load-repr-sample", action="store_true")
+    parser.add_argument("--repr-batch-size", type=int, default=32)
+    parser.add_argument("--repr-num-epochs", type=int, default=500)
     parser.add_argument("--skip-existing", dest="skip_existing", action="store_true", default=True)
     parser.add_argument("--no-skip-existing", dest="skip_existing", action="store_false")
     parser.add_argument("--num-workers", type=int, default=4)
