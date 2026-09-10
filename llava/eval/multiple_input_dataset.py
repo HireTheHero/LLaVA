@@ -58,6 +58,8 @@ def arg_parser():
             "TextVQA",
             "MMBench",
             "MM-Vet",
+            "GQA_train_selector",
+            "TextVQA_train_selector",
         ],
         help="task type",
     )
@@ -85,6 +87,27 @@ def arg_parser():
     )
     parser.add_argument(
         "--sim-method", type=str, default="cosine", help="Similarity method"
+    )
+    parser.add_argument(
+        "--num-shots", type=int, default=1,
+        help="Number of ICL shots (top-K similar references)",
+    )
+    parser.add_argument(
+        "--shot-order", type=str, default="forward",
+        choices=["forward", "reversed", "random"],
+        help="Demonstration ordering: forward (most-similar-first), reversed, random",
+    )
+    parser.add_argument(
+        "--root-path",
+        type=str,
+        default=None,
+        help="Override root_path from config file (path to eval directory)",
+    )
+    parser.add_argument(
+        "--exclude-ids",
+        type=str,
+        default=None,
+        help="Path to a text file listing mix665k indices to exclude from the reference pool.",
     )
     args = parser.parse_args()
     return args
@@ -121,7 +144,9 @@ def preprocess_dataset(
 
 def load_dataset(args: Namespace, logger: Logger) -> pd.DataFrame:
     config = yaml.load(open(args.config_path, "r"), Loader=yaml.FullLoader)
-    data_path = f"{config['root_path']}/{config[args.task]['prefix']}/{config[args.task]['questions']}"
+    # Use --root-path if provided, otherwise use config file
+    root_path = args.root_path if args.root_path else config['root_path']
+    data_path = f"{root_path}/{config[args.task]['prefix']}/{config[args.task]['questions']}"
     if data_path.endswith(".tsv"):
         org_data = pd.read_table(data_path)
     elif data_path.endswith(".jsonl"):
@@ -253,12 +278,25 @@ def load_reference_dataset(
     args: Namespace, filename: str = "llava_v1_5_mix665k.json"
 ) -> pd.DataFrame:
     train_file = f"{args.train_path}/{filename}"
-    train = pd.DataFrame(json.load(open(train_file, "r"))).dropna(subset="image")
+    raw_data = json.load(open(train_file, "r"))
+    train = pd.DataFrame(raw_data).dropna(subset="image")
+    # Preserve the original mix665k index for exclude-ids filtering
+    train["_mix665k_idx"] = train.index
     train["source"] = train["image"].apply(lambda x: x.split("/")[0])
-    if args.task.lower() in train["source"].unique():
-        train = train[train["source"] == args.task.lower()].reset_index(drop=True)
+    # Strip _train_selector suffix for source matching (e.g. TextVQA_train_selector -> textvqa)
+    source_key = re.sub(r"_train_selector$", "", args.task.lower())
+    if source_key in train["source"].unique():
+        train = train[train["source"] == source_key].reset_index(drop=True)
     else:
         train = train[train["source"] == "coco"].reset_index(drop=True)
+    # Exclude specified mix665k indices (e.g. query IDs used for probe training)
+    exclude_ids_path = getattr(args, "exclude_ids", None)
+    if exclude_ids_path and os.path.isfile(exclude_ids_path):
+        with open(exclude_ids_path, "r") as f:
+            exclude_set = set(int(line.strip()) for line in f if line.strip())
+        before = len(train)
+        train = train[~train["_mix665k_idx"].isin(exclude_set)].reset_index(drop=True)
+        print(f"Excluded {before - len(train)} reference entries (from {exclude_ids_path})")
     train["first_question"] = train["conversations"].apply(lambda x: x[0]["value"])
     train["first_question"] = train["first_question"].apply(
         lambda x: re.sub(DEFAULT_IMAGE_TOKEN, "", x)
@@ -335,6 +373,30 @@ def extract_most_similar_reference(similarity, reference, col_dict):
     return most_similar_reference
 
 
+def extract_topk_similar_cols(similarity, data, col_dict, k=1, order="forward"):
+    """Extract top-K most similar references for each query.
+
+    Returns a list of K dicts, each mapping col_dict keys to numpy arrays.
+    Results are ordered according to ``order``:
+      - forward: most-similar first
+      - reversed: least-similar first
+      - random: shuffled
+    """
+    _, topk_idx = torch.topk(similarity, k, dim=1)  # [num_queries, k]
+    if order == "reversed":
+        topk_idx = topk_idx.flip(dims=[1])
+    elif order == "random":
+        perm = torch.stack([torch.randperm(k) for _ in range(topk_idx.size(0))])
+        topk_idx = topk_idx.gather(1, perm)
+    results = []
+    for shot_i in range(k):
+        shot_ref = {}
+        for ky in col_dict.keys():
+            shot_ref[ky] = data[col_dict[ky]].to_numpy()[topk_idx[:, shot_i].numpy()].astype(str)
+        results.append(shot_ref)
+    return results
+
+
 def insert_reference(org_data, reference, org_col_dict, sep="__sep__"):
     out = org_data.copy()
     for ky in org_col_dict.keys():
@@ -365,14 +427,36 @@ def create_dataset_with_reference(
     },
 ):
     """
-    Create a dataset with reference input
+    Create a dataset with reference input.
+
+    When ``args.num_shots`` > 1, selects the top-K most similar references
+    and chains them via ``insert_reference`` so that the final ``__sep__``
+    order matches the requested ``args.shot_order``.
     """
+    num_shots = getattr(args, "num_shots", 1)
+    shot_order = getattr(args, "shot_order", "forward")
+
     q_reprs, r_reprs = torch.cat(q_reprs, dim=0), torch.cat(r_reprs, dim=0)
     similarity = calculate_similarity(q_reprs, r_reprs, method=args.sim_method)
-    most_similar_reference = extract_most_similar_reference(
-        similarity, org_reference, ref_col_dict
-    )
-    data_w_reference = insert_reference(org_data, most_similar_reference, org_col_dict)
+
+    if num_shots == 1 and shot_order == "forward":
+        # Legacy path: identical to the original single-shot behaviour
+        most_similar_reference = extract_most_similar_reference(
+            similarity, org_reference, ref_col_dict
+        )
+        data_w_reference = insert_reference(org_data, most_similar_reference, org_col_dict)
+    else:
+        # K-shot path
+        results = extract_topk_similar_cols(
+            similarity, org_reference, ref_col_dict, k=num_shots, order=shot_order,
+        )
+        data_w_reference = org_data.copy()
+        # Insert in reverse so the first result (according to the requested
+        # ordering) ends up as the outermost prepend, i.e. first in the
+        # __sep__ chain.
+        for shot_ref in reversed(results):
+            data_w_reference = insert_reference(data_w_reference, shot_ref, org_col_dict)
+
     return data_w_reference
 
 
@@ -380,7 +464,9 @@ def save_dataset(args, config, data_w_reference):
     """
     Save a dataset with reference input
     """
-    data_path = f"{config['root_path']}/{config[args.task]['prefix']}/{args.prefix}{config[args.task]['questions']}"
+    root_path = args.root_path if args.root_path else config["root_path"]
+    root_path = os.path.expandvars(root_path)
+    data_path = f"{root_path}/{config[args.task]['prefix']}/{args.prefix}{config[args.task]['questions']}"
     assert not os.path.isfile(data_path), f"File {data_path} already exists"
     if data_path.endswith(".tsv"):
         data_w_reference.to_csv(data_path, sep="\t", index=False)

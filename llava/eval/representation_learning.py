@@ -1,6 +1,8 @@
 # from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
+import logging
+import time
 import gzip
 import itertools
 # import math
@@ -9,6 +11,7 @@ import pickle
 from pprint import pprint
 import psutil
 import random
+import sys
 from tqdm import tqdm
 
 from einops import repeat
@@ -29,6 +32,18 @@ from torch.utils.data.dataloader import default_collate
 from transformers import LlamaForCausalLM, LlamaTokenizer
 
 from llava.eval.utils import makedirs_recursive  # , split_list
+
+def get_logger():
+    logger = logging.getLogger("mcicl.representation_learning")
+    if not logger.handlers:
+        handler = logging.StreamHandler(sys.stdout)
+        formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
+    return logger
+
+LOGGER = get_logger()
 
 
 def set_seed(seed):
@@ -91,7 +106,7 @@ class CustomDataset(Dataset):
         if self.fixed_effect_indices is not None:
             idx = self.fixed_effect_indices[index]
         else:
-            idx = None
+            idx = torch.tensor(-1)
         return q_embed, t_embed, q_answers, t_answers, idx
 
 
@@ -102,7 +117,8 @@ class CustomDatasetConfig:
     # batch_size: int = 10
     # batch_size: int = 12
     batch_size: int = 16
-    test_size: float = 0.2
+    val_size: float = 0.1
+    test_size: float = 0.1
     # num_workers: int = 4
 
 
@@ -176,11 +192,9 @@ def custom_collate(batch, logger = None,):
         return default_collate(batch)
     except RuntimeError as e:
         # Handle or preprocess batch elements here
-        if logger:
-            logger.warn(f"Iteration failure: {batch}")
-        else:
-            print(f"Iteration failure: {batch}")
-            raise e
+        active_logger = logger if logger else LOGGER
+        active_logger.warning(f"Iteration failure: {batch}")
+        raise e
 
 
 def create_data_loader(
@@ -189,6 +203,7 @@ def create_data_loader(
     query_text,
     target_text,
     fixed_effect_indices_and_mapping=None,
+    batch_size_override=None,
     is_category_wise_eval=False,
     custom_collate=None,
     logger=None,
@@ -202,7 +217,7 @@ def create_data_loader(
     else:
         fixed_effect_indices = None
     config = CustomDatasetConfig()
-    batch_size = config.batch_size
+    batch_size = batch_size_override if batch_size_override is not None else config.batch_size
     # query_embed_batched = split_list(query_embed, batch_size)
     dataset = CustomDataset(
         query_embed,
@@ -212,8 +227,15 @@ def create_data_loader(
         fixed_effect_indices,
     )
     test_size = round(len(dataset) * config.test_size)
-    train_size = len(dataset) - test_size
-    train_ds, test_ds = random_split(dataset, [train_size, test_size])
+    val_size = round(len(dataset) * config.val_size)
+    train_size = len(dataset) - test_size - val_size
+    if train_size <= 0:
+        raise ValueError(
+            f"Split sizes too large: train={train_size} val={val_size} test={test_size}"
+        )
+    train_ds, val_ds, test_ds = random_split(
+        dataset, [train_size, val_size, test_size]
+    )
     train_dataloader = DataLoader(
         train_ds, 
         batch_size=batch_size, 
@@ -221,17 +243,23 @@ def create_data_loader(
         # collate_fn=lambda x: x,
         collate_fn=collate,
     )
+    val_data = DataLoader(
+        val_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=collate,
+    )
     if is_category_wise_eval:
         test_data = ExtendedCustomDataset(test_ds, list(set(mapping.values())))
     else:
         test_data = DataLoader(
-            test_ds, 
-            batch_size=batch_size, 
-            shuffle=False, 
+            test_ds,
+            batch_size=batch_size,
+            shuffle=False,
             # collate_fn=lambda x: x,
             collate_fn=collate,
         )
-    return train_dataloader, test_data
+    return train_dataloader, val_data, test_data
 
 
 @dataclass
@@ -444,34 +472,55 @@ class RandomEffectProbe(nn.Module):
         return x_out
 
 
+def resolve_device(device_name):
+    if device_name in (None, "auto"):
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device_name == "cuda":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device_name == "cpu":
+        return torch.device("cpu")
+    raise ValueError(f"Device {device_name} not supported")
+
+
 def load_objects(
-    dtype4model=torch.float32, tasks=None, models=None, model_type="attention"
+    text_model_dtype=torch.float32,
+    contrastive_model_dtype=torch.float32,
+    tasks=None,
+    models=None,
+    model_type="attention",
+    text_device_override="cpu",
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    text_device = resolve_device(text_device_override)
     config = CustomModelConfig()
     # text tokenizer and model
     tokenizer = LlamaTokenizer.from_pretrained(config.text_model)
     tokenizer.pad_token = config.pad_token
     text_model = LlamaForCausalLM.from_pretrained(config.text_model)
+    text_model = text_model.to(device=text_device, dtype=text_model_dtype)
     # contrastive model
     if tasks is not None and models is not None:
         fixed_effect_indices, mapping = index_lists(list(zip(tasks, models)))
     else:
         fixed_effect_indices = None
+        mapping = None
+        if model_type in ("linear", "mixed"):
+            LOGGER.warning(f"model_type '{model_type}' requires mapping; defaulting to 'attention'.")
+            model_type = "attention"
     if model_type == "attention":
         contrastive_model = ContrastiveAttention(config).to(
-            device=device, dtype=dtype4model
+            device=device, dtype=contrastive_model_dtype
         )
     elif model_type == "linear":
         contrastive_model = RandomEffectModel(
             config.embed_dim, config.embed_dim, len(mapping), 512
         ).to(
-            device=device, dtype=dtype4model
+            device=device, dtype=contrastive_model_dtype
         )
     elif model_type == "mixed":
         contrastive_model = MixedEffectModel(
             config.embed_dim, config.embed_dim, len(mapping), 512
-        ).to(device=device, dtype=dtype4model)
+        ).to(device=device, dtype=contrastive_model_dtype)
     else:
         raise ValueError(f"Contrastive model {model_type} not supported")
     distance = CosineSimilarity()
@@ -490,10 +539,22 @@ def load_objects(
         cont_optimizer,
         distance,
         device,
-        dtype4model,
+        contrastive_model_dtype,
         fixed_effect_indices,
         mapping,
     )
+
+
+def parse_text_model_dtype(dtype_str):
+    if dtype_str is None:
+        return torch.float32
+    if dtype_str == "fp16":
+        return torch.float16
+    if dtype_str == "bf16":
+        return torch.bfloat16
+    if dtype_str == "fp32":
+        return torch.float32
+    raise ValueError(f"Text model dtype {dtype_str} not supported")
 
 
 def embed_sentences(sentences, tokenizer, model, padding_num=4096):
@@ -515,10 +576,10 @@ def embed_sentences(sentences, tokenizer, model, padding_num=4096):
     #     truncation=True,
     #     max_length=4096,
     # )["input_ids"]
+    model_device = next(model.parameters()).device
+    input_ids = input_ids.to(device=model_device)
     with torch.no_grad():
-        sentences_embed = model(input_ids, return_dict=True, output_hidden_states=True)[
-            "hidden_states"
-        ]
+        sentences_embed = model(input_ids, return_dict=True, output_hidden_states=True)["hidden_states"]
     sentences_embed_pad = F.pad(
         sentences_embed[-1],
         (0, 0, 0, padding_num - sentences_embed[-1].shape[1]),
@@ -539,12 +600,15 @@ def output_contextual_embeddings(
         output = contrastive_model(query_embed, fixed_effect_idx)
     elif model_type == "attention":
         output, att = contrastive_model(query_embed, target_embed)
+        if (not torch.isfinite(output).all()) or (not torch.isfinite(att).all()):
+            _log_tensor_stats("diag/attention_output", output, LOGGER)
+            _log_tensor_stats("diag/attention_weights", att, LOGGER)
     else:
         raise ValueError(f"Contrastive model {model_type} not supported")
     return output
 
 
-def train_loop(args, objects, train_dataloader, logger=None):
+def train_loop(args, objects, train_dataloader, val_dataloader=None, logger=None):
     (
         config,
         contrastive_model,
@@ -558,12 +622,23 @@ def train_loop(args, objects, train_dataloader, logger=None):
         _,
         _,
     ) = objects
-    n_epochs = config.n_epochs
+    n_epochs = getattr(args, "repr_num_epochs", config.n_epochs)
     contrastive_model.train()
     # text_model.eval()
-    best_loss = None
+    best_val_loss = None
+    best_model = None
+    train_losses = []
+    val_losses = []
+    val_every = getattr(args, "repr_val_epoch", 10)
+    log_every = getattr(args, "log_progress_every", None)
+    if log_every is None:
+        log_every = 100
+    diag_logged = False
+    non_finite_logged = False
     for epoch in range(n_epochs):
         total_loss = 0.0
+        epoch_start = time.time()
+        total_steps = len(train_dataloader)
         for i, batch in enumerate(train_dataloader):
             query_embed, target_embed, query_text, _, fixed_effect_idx = batch
             query_embed = query_embed.to(device=device, dtype=dtype4model)
@@ -577,10 +652,28 @@ def train_loop(args, objects, train_dataloader, logger=None):
                 target_embed,
                 fixed_effect_idx=fixed_effect_idx,
             )
+            if not non_finite_logged and not torch.isfinite(output).all():
+                log_or_print("[DIAG] train/output has non-finite values.", logger)
+                _log_tensor_stats("train/output", output, logger)
+                _log_model_param_stats("train/contrastive_model", contrastive_model, logger)
+                non_finite_logged = True
+            if not diag_logged and epoch == 0 and i == 0:
+                _log_tensor_stats("train/query_embed", query_embed, logger)
+                _log_tensor_stats("train/target_embed", target_embed, logger)
+                _log_tensor_stats("train/output", output, logger)
             loss = cont_criterion(
-                output.reshape(output.shape[0], -1),
-                target_embed.reshape(target_embed.shape[0], -1),
+                output.float().reshape(output.shape[0], -1),
+                target_embed.float().reshape(target_embed.shape[0], -1),
             )
+            if not diag_logged and epoch == 0 and i == 0:
+                log_or_print(f"[DIAG] train/loss: value={loss.item()} finite={torch.isfinite(loss).item()}", logger)
+                diag_logged = True
+            if not non_finite_logged and not torch.isfinite(loss).item():
+                log_or_print("[DIAG] train/loss is non-finite.", logger)
+                _log_tensor_stats("train/output", output, logger)
+                _log_tensor_stats("train/target_embed", target_embed, logger)
+                _log_model_param_stats("train/contrastive_model", contrastive_model, logger)
+                non_finite_logged = True
             total_loss += loss.item()
             cont_optimizer.zero_grad()
             loss.backward()
@@ -590,28 +683,44 @@ def train_loop(args, objects, train_dataloader, logger=None):
             del output
             # process = psutil.Process()
             # log_or_print(f"Memory used in train loop: {process.memory_info().rss}", logger)
+            log_progress(
+                f"Train epoch {epoch + 1}/{n_epochs}",
+                i + 1,
+                total_steps,
+                epoch_start,
+                log_every,
+                logger,
+                loss=loss.item(),
+                device=device,
+            )
+        avg_train_loss = total_loss / max(1, len(train_dataloader))
+        train_losses.append(avg_train_loss)
         log_or_print(f"Epoch [{epoch+1}/{n_epochs}], Loss: {total_loss}", logger)
         process = psutil.Process()
         log_or_print(f"Memory used in train loop: {process.memory_info().rss}", logger)
 
-        if best_loss is None or total_loss < best_loss:
-            best_loss = total_loss
-            best_model = contrastive_model.state_dict()
-
-            # Get the current datetime
-            now = datetime.now()
-            # Format the datetime as yymmddhhmmss
-            timestamp_str = now.strftime('%y%m%d%H%M%S')
-
-            save_dir_fin = f"{args.root_path}/contrastive_model"
-            makedirs_recursive(save_dir_fin)
-            torch.save(best_model, f"{save_dir_fin}/{timestamp_str}_{args.contrastive_model}.pt")
+        if val_dataloader is not None and ((epoch + 1) % val_every == 0 or (epoch + 1) == n_epochs):
+            contrastive_model.eval()
+            _, val_loss = eval_loop(args, objects, val_dataloader, logger=logger)
+            val_losses.append((epoch + 1, val_loss))
+            log_or_print(f"Val epoch {epoch + 1}/{n_epochs}, Loss: {val_loss}", logger)
+            if best_val_loss is None or val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_model = contrastive_model.state_dict()
+                now = datetime.now()
+                timestamp_str = now.strftime('%y%m%d%H%M%S')
+                save_dir_fin = f"{args.root_path}/contrastive_model"
+                makedirs_recursive(save_dir_fin)
+                torch.save(best_model, f"{save_dir_fin}/{timestamp_str}_{args.contrastive_model}.pt")
+            contrastive_model.train()
         elif total_loss == 0.0:
             log_or_print("Loss is 0.0. Stopping training.", logger)
             break
         else:
             pass
-    return best_model
+    if best_model is None:
+        best_model = contrastive_model.state_dict()
+    return best_model, train_losses, val_losses
 
 
 def calculate_sample_wise_similarity(query_embed, target_embed):
@@ -662,9 +771,14 @@ def eval_loop(args, objects, test_data, is_category_wise_eval=False, logger=None
     else:
         log_or_print("Sample-wise evaluation", logger)
         outputs = {"query_target": [], "score_target": [], "answers": [], "fixed_effect_idx": []}
+    log_every = getattr(args, "log_progress_every", None)
+    if log_every is None:
+        log_every = 100
     with torch.no_grad():
         if is_category_wise_eval:
-            for entry in tqdm(test_data):
+            eval_start = time.time()
+            total_steps = len(test_data)
+            for entry_idx, entry in enumerate(tqdm(test_data), start=1):
                 for ct in entry.keys():
                     entry_ct = entry[ct]
                     if not entry_ct:
@@ -698,8 +812,8 @@ def eval_loop(args, objects, test_data, is_category_wise_eval=False, logger=None
                             query_answer_embed, target_answer_embed
                         ).to("cpu")
                         loss = cont_criterion(
-                            output.reshape(output.shape[0], -1),
-                            target_embed.reshape(target_embed.shape[0], -1),
+                            output.float().reshape(output.shape[0], -1),
+                            target_embed.float().reshape(target_embed.shape[0], -1),
                         )
                         del query_embed
                         del target_embed
@@ -718,9 +832,21 @@ def eval_loop(args, objects, test_data, is_category_wise_eval=False, logger=None
                         outputs[f"{ct}_score_target"].append(dist_score_tgt)
                         outputs[f"{ct}_answers"].append(dist_ans)
                         outputs[f"{ct}_loss"].append(loss.item())
+                log_progress(
+                    "Eval category-wise",
+                    entry_idx,
+                    total_steps,
+                    eval_start,
+                    log_every,
+                    logger,
+                    loss=loss.item() if "loss" in locals() else None,
+                    device=device,
+                )
 
         else:
-            for batch in tqdm(test_data):
+            eval_start = time.time()
+            total_steps = len(test_data)
+            for batch_idx, batch in enumerate(tqdm(test_data), start=1):
                 query_embed, target_embed, query_text, target_text, fixed_effect_idx = batch
                 query_embed = query_embed.to(device=device, dtype=dtype4model)
                 target_embed = target_embed.to(device=device, dtype=dtype4model)
@@ -752,10 +878,20 @@ def eval_loop(args, objects, test_data, is_category_wise_eval=False, logger=None
                 outputs["answers"].append(dist_ans)
                 outputs["fixed_effect_idx"].append(fixed_effect_idx)
                 loss = cont_criterion(
-                    output.reshape(output.shape[0], -1),
-                    target_embed.reshape(target_embed.shape[0], -1),
+                    output.float().reshape(output.shape[0], -1),
+                    target_embed.float().reshape(target_embed.shape[0], -1),
                 )
                 losses.append(loss.item())
+                log_progress(
+                    "Eval sample-wise",
+                    batch_idx,
+                    total_steps,
+                    eval_start,
+                    log_every,
+                    logger,
+                    loss=loss.item() if "loss" in locals() else None,
+                    device=device,
+                )
     if is_category_wise_eval:
         pass
     else:
@@ -765,14 +901,23 @@ def eval_loop(args, objects, test_data, is_category_wise_eval=False, logger=None
 
 def evaluate_embeddings(model_outputs):
     # colors = ["darkblue" if l==1 else "lightgray" for l in labels]
+    def _to_numpy_float(value):
+        if isinstance(value, torch.Tensor):
+            return value.float().cpu().numpy()
+        return np.asarray(value)
+
     if isinstance(model_outputs["query_target"][0], torch.Tensor):
-        query_target = torch.cat(model_outputs["query_target"]).reshape(-1).numpy()
-        score_target = torch.cat(model_outputs["score_target"]).reshape(-1).numpy()
-        answers = torch.cat(model_outputs["answers"]).reshape(-1).numpy()
+        query_target = _to_numpy_float(
+            torch.cat(model_outputs["query_target"]).reshape(-1)
+        )
+        score_target = _to_numpy_float(
+            torch.cat(model_outputs["score_target"]).reshape(-1)
+        )
+        answers = _to_numpy_float(torch.cat(model_outputs["answers"]).reshape(-1))
     else:
-        query_target = model_outputs["query_target"]
-        score_target = model_outputs["score_target"]
-        answers = model_outputs["answers"]
+        query_target = _to_numpy_float(model_outputs["query_target"])
+        score_target = _to_numpy_float(model_outputs["score_target"])
+        answers = _to_numpy_float(model_outputs["answers"])
 
     input_dict = {
         "query_target": query_target,
@@ -859,11 +1004,110 @@ def load_file_or_object(file_or_object):
 
 
 def log_or_print(msg, logger=None):
-    if logger:
-        logger.info(msg)
-    else:
-        print(msg)
+    active_logger = logger if logger else LOGGER
+    active_logger.info(msg)
     return
+
+
+def _summarize_tensor(tensor):
+    stats = {
+        "dtype": str(tensor.dtype),
+        "device": str(tensor.device),
+        "shape": tuple(tensor.shape),
+        "total": tensor.numel(),
+    }
+    finite_mask = torch.isfinite(tensor)
+    finite_count = finite_mask.sum().item()
+    stats["finite"] = finite_count
+    if finite_count > 0:
+        finite_vals = tensor[finite_mask]
+        stats["min"] = finite_vals.min().item()
+        stats["max"] = finite_vals.max().item()
+        stats["mean"] = finite_vals.mean().item()
+    else:
+        stats["min"] = None
+        stats["max"] = None
+        stats["mean"] = None
+    return stats
+
+
+def _log_tensor_stats(name, tensor, logger=None):
+    stats = _summarize_tensor(tensor)
+    log_or_print(
+        f"[DIAG] {name}: shape={stats['shape']} dtype={stats['dtype']} device={stats['device']} "
+        f"finite={stats['finite']}/{stats['total']} min={stats['min']} max={stats['max']} mean={stats['mean']}",
+        logger,
+    )
+
+
+def _log_model_param_stats(name, model, logger=None, max_params=5):
+    non_finite_params = []
+    for param_name, param in model.named_parameters():
+        if param is None:
+            continue
+        with torch.no_grad():
+            data = param.data
+            finite_mask = torch.isfinite(data)
+            if finite_mask.all():
+                continue
+            non_finite_params.append((param_name, data))
+    if not non_finite_params:
+        log_or_print(f"[DIAG] {name}: all parameters finite.", logger)
+        return
+    log_or_print(
+        f"[DIAG] {name}: non-finite params={len(non_finite_params)}/{len(list(model.named_parameters()))}",
+        logger,
+    )
+    for param_name, data in non_finite_params[:max_params]:
+        _log_tensor_stats(f"{name}.{param_name}", data, logger)
+
+
+def _log_embedding_sample_stats(name, embeddings, logger=None, sample_count=3):
+    if not isinstance(embeddings, list):
+        return
+    sample_count = min(sample_count, len(embeddings))
+    non_finite_samples = 0
+    for idx in range(sample_count):
+        item = embeddings[idx]
+        if isinstance(item, torch.Tensor):
+            stats = _summarize_tensor(item)
+            if stats["finite"] != stats["total"]:
+                non_finite_samples += 1
+            log_or_print(
+                f"[DIAG] {name}[{idx}]: shape={stats['shape']} dtype={stats['dtype']} "
+                f"finite={stats['finite']}/{stats['total']} min={stats['min']} max={stats['max']} mean={stats['mean']}",
+                logger,
+            )
+        else:
+            log_or_print(f"[DIAG] {name}[{idx}]: type={type(item)}", logger)
+    if non_finite_samples > 0:
+        log_or_print(f"[DIAG] {name}: {non_finite_samples}/{sample_count} samples contain non-finite values.", logger)
+
+
+def log_progress(phase, step, total, start_time, log_every, logger=None, loss=None, device=None):
+    if not total or not log_every or log_every <= 0:
+        return
+    if step % log_every != 0 and step != total:
+        return
+    elapsed = time.time() - start_time
+    rate = step / elapsed if elapsed > 0 else 0.0
+    remaining = total - step
+    eta_seconds = remaining / rate if rate > 0 else 0.0
+    percent = (step / total) * 100
+    process = psutil.Process()
+    rss = process.memory_info().rss / (1024 ** 2)
+    vms = process.memory_info().vms / (1024 ** 2)
+    mem_msg = f"rss={rss:.1f}MB vms={vms:.1f}MB"
+    if torch.cuda.is_available() and (device is None or device.type == "cuda"):
+        allocated = torch.cuda.memory_allocated() / (1024 ** 2)
+        reserved = torch.cuda.memory_reserved() / (1024 ** 2)
+        mem_msg += f" gpu_alloc={allocated:.1f}MB gpu_res={reserved:.1f}MB"
+    loss_msg = f" loss={loss:.4f}" if loss is not None else ""
+    log_or_print(
+        f"{phase}: {step}/{total} ({percent:.1f}%) "
+        f"elapsed={elapsed:.0f}s eta={eta_seconds:.0f}s{loss_msg} {mem_msg}",
+        logger,
+    )
 
 
 def load_files_or_objects_w_substr(
@@ -931,6 +1175,8 @@ def learn_repr(args, query_embed, target_embed, query_text, target_text, logger=
         sample_size=args.sample_size,
     )
     log_or_print(f"target_text loaded with size: {len(target_text)}", logger)
+    _log_embedding_sample_stats("query_embed", query_embed, logger)
+    _log_embedding_sample_stats("target_embed", target_embed, logger)
     assert len(query_embed) == len(target_embed) == len(query_text) == len(target_text), f"Lengths of inputs do not match: {len(query_embed), len(target_embed), len(query_text), len(target_text)}"
     # labels = [1 if q==t else 0 for q,t in zip(query_text, target_text)]
     # assert set(labels) == {0, 1}, f"Labels not binary: {set(labels)}"
@@ -939,16 +1185,40 @@ def learn_repr(args, query_embed, target_embed, query_text, target_text, logger=
     # else:
     #     print(f"Labels: {Counter(labels)}")
     set_seed(args.seed)
-    train_dataloader, test_dataloader = create_data_loader(
-        query_embed, target_embed, query_text, target_text, None
+    tasks = None
+    models = None
+    if getattr(args, "task_name", None) and getattr(args, "model_name", None):
+        tasks = [args.task_name] * len(query_text)
+        models = [args.model_name] * len(query_text)
+    objects = load_objects(
+        model_type=args.contrastive_model,
+        tasks=tasks,
+        models=models,
+        text_device_override=getattr(args, "repr_text_device", "cpu"),
+        text_model_dtype=parse_text_model_dtype(getattr(args, "text_model_dtype", None)),
+        contrastive_model_dtype=parse_text_model_dtype(
+            getattr(args, "cont_model_dtype", None)
+        ),
+    )
+    log_or_print("Objects loaded", logger)
+    fixed_effect_indices_and_mapping = None
+    if objects[-2] is not None and objects[-1] is not None:
+        fixed_effect_indices_and_mapping = [objects[-2], objects[-1]]
+    train_dataloader, val_dataloader, test_dataloader = create_data_loader(
+        query_embed,
+        target_embed,
+        query_text,
+        target_text,
+        fixed_effect_indices_and_mapping,
+        batch_size_override=getattr(args, "repr_batch_size", None),
     )
     log_or_print(
         f"Dataset created with size: {len(train_dataloader.dataset), len(test_dataloader.dataset)}",
         logger,
     )
-    objects = load_objects(model_type=args.contrastive_model)
-    log_or_print("Objects loaded", logger)
-    model_state_dict = train_loop(args, objects, train_dataloader, logger=logger)
+    model_state_dict, train_losses, val_losses = train_loop(
+        args, objects, train_dataloader, val_dataloader=val_dataloader, logger=logger
+    )
     objects[1].load_state_dict(model_state_dict)
     log_or_print("Model trained", logger)
     eval_outputs, total_loss = eval_loop(args, objects, test_dataloader, logger=logger)
@@ -958,6 +1228,28 @@ def learn_repr(args, query_embed, target_embed, query_text, target_text, logger=
     # fig_after.write_html(f"{args.extract_path}/repr_after.html")
     # fig = evaluate_embeddings(eval_outputs, labels)
     fig_3d, fig, df = evaluate_embeddings(eval_outputs)
+    save_dir_fin = f"{args.root_path}/contrastive_model"
+    makedirs_recursive(save_dir_fin)
+    loss_fig = go.Figure()
+    loss_fig.add_trace(
+        go.Scatter(
+            x=list(range(1, len(train_losses) + 1)),
+            y=train_losses,
+            mode="lines",
+            name="train_loss",
+        )
+    )
+    if val_losses:
+        val_epochs, val_vals = zip(*val_losses)
+        loss_fig.add_trace(
+            go.Scatter(
+                x=list(val_epochs),
+                y=list(val_vals),
+                mode="lines+markers",
+                name="val_loss",
+            )
+        )
+    loss_fig.write_html(f"{save_dir_fin}/repr_loss_plot.html")
 
     # fig_3d.write_html(f"{args.extract_path}/repr_plot_3d.html")
     # fig.write_html(f"{args.extract_path}/repr_plot_2d.html")
@@ -1101,16 +1393,22 @@ def learn_repr_tasks(args, logger=None, is_category_wise_eval=False):
         model_type=args.contrastive_model,
         tasks=tasks,
         models=models,
+        text_device_override=getattr(args, "repr_text_device", "cpu"),
+        text_model_dtype=parse_text_model_dtype(getattr(args, "text_model_dtype", None)),
+        contrastive_model_dtype=parse_text_model_dtype(
+            getattr(args, "cont_model_dtype", None)
+        ),
     )
     log_or_print("Objects loaded", logger)
     # log_or_print(f"Category indices: {objects[-2]}", logger)
     # log_or_print(f"Category map: {objects[-1]}", logger)
-    train_dataloader, test_data = create_data_loader(
+    train_dataloader, val_dataloader, test_data = create_data_loader(
         query_embed, 
         target_embed, 
         query_text, 
         target_text, 
         fixed_effect_indices_and_mapping=[objects[-2], objects[-1]], 
+        batch_size_override=getattr(args, "repr_batch_size", None),
         is_category_wise_eval=is_category_wise_eval,
         custom_collate=None,
         logger=logger,
@@ -1121,7 +1419,9 @@ def learn_repr_tasks(args, logger=None, is_category_wise_eval=False):
         f"Dataloader created with # of batches: {len(train_dataloader.dataset), len(test_data.dataset)}",
         logger,
     )
-    model_state_dict = train_loop(args, objects, train_dataloader, logger=logger)
+    model_state_dict, train_losses, val_losses = train_loop(
+        args, objects, train_dataloader, val_dataloader=val_dataloader, logger=logger
+    )
     # args.extract_path = f"{args.root_path}/contrastive_model"
     # log_or_print(f"Loading model from {args.extract_path}", logger)
     # model_state_dict = torch.load(f"{args.extract_path}/240705110100_mixed.pt")
@@ -1136,6 +1436,28 @@ def learn_repr_tasks(args, logger=None, is_category_wise_eval=False):
     )
     # log_or_print(f"eval_outputs: \n{eval_outputs}", logger)
     log_or_print(f"Test loss: {total_loss}", logger)
+    save_dir_fin = f"{args.root_path}/contrastive_model"
+    makedirs_recursive(save_dir_fin)
+    loss_fig = go.Figure()
+    loss_fig.add_trace(
+        go.Scatter(
+            x=list(range(1, len(train_losses) + 1)),
+            y=train_losses,
+            mode="lines",
+            name="train_loss",
+        )
+    )
+    if val_losses:
+        val_epochs, val_vals = zip(*val_losses)
+        loss_fig.add_trace(
+            go.Scatter(
+                x=list(val_epochs),
+                y=list(val_vals),
+                mode="lines+markers",
+                name="val_loss",
+            )
+        )
+    loss_fig.write_html(f"{save_dir_fin}/repr_loss_plot.html")
     idx_wise_outputs = create_idx_wise_dict(eval_outputs, mapping=objects[-1])
     # log_or_print(f"idx_wise_outputs: \n{idx_wise_outputs}", logger)
     log_or_print(f"Index-wise outputs created", logger)

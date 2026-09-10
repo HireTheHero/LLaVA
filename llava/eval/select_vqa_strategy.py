@@ -11,6 +11,7 @@ import random
 
 import numpy as np
 import optuna
+import plotly.graph_objects as go
 from sklearn.metrics import accuracy_score, recall_score
 import torch
 import torch.nn as nn
@@ -43,6 +44,12 @@ def parse_args():
     parser.add_argument("--model", type=str, required=True, help="Model name.")
     parser.add_argument(
         "--batch-size", type=int, default=32, help="Batch size for DataLoader."
+    )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=0,
+        help="Number of DataLoader workers.",
     )
     parser.add_argument(
         "--epochs", type=int, default=10, help="Number of training epochs."
@@ -81,10 +88,26 @@ def parse_args():
     parser.add_argument("--loss-type", type=str, default="cross_entropy", choices=["cross_entropy", "focal"], help="Loss function type.")
     parser.add_argument("--use-optuna", action="store_true", help="Use Optuna for hyperparameter search.")
     parser.add_argument("--gamma", type=float, default=2.0, help="Gamma value for Focal Loss.")
+    parser.add_argument("--probe-val-epoch", type=int, default=1, help="Log validation every N epochs.")
     parser.add_argument("--test-only", action="store_true", help="Only test the model without training.")
     parser.add_argument("--train-timestamp", type=str, default=None, help="Timestamp of the training run to load the model from.")
     parser.add_argument("--weight-loss", action="store_true", help="Use weighted loss.")
     parser.add_argument("--positive-weight", type=float, default=10.0, help="Weights for positive samples.")
+    parser.add_argument("--confidence-interval", action="store_true",
+                        help="Compute and print 95%% bootstrap confidence interval for accuracy metrics.")
+    # --- Separate train/test data (USE_TRAIN_TO_SELECT mode) ---
+    parser.add_argument("--train-tensor-dir", type=str, default=None,
+                        help="Directory with training hidden states (overrides internal split).")
+    parser.add_argument("--train-csv-file1", type=str, default=None,
+                        help="Training correctness CSV (ICL model, i.e. prefix+model).")
+    parser.add_argument("--train-csv-file2", type=str, default=None,
+                        help="Training correctness CSV (ZSL model, i.e. model only).")
+    parser.add_argument("--test-tensor-dir", type=str, default=None,
+                        help="Directory with test hidden states (overrides internal split).")
+    parser.add_argument("--test-csv-file1", type=str, default=None,
+                        help="Test correctness CSV (ICL model).")
+    parser.add_argument("--test-csv-file2", type=str, default=None,
+                        help="Test correctness CSV (ZSL model).")
     args = parser.parse_args()
     return args
 
@@ -351,10 +374,15 @@ def train_model(
     epochs,
     train_path="best_model.pt",
     deactivate_wandb=False,
+    val_every=1,
+    plot_path=None,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     best_eval_loss = float("inf")
     model.to(device)
+    val_every = max(1, val_every)
+    train_losses = []
+    eval_losses = []
     for epoch in range(epochs):
         model.train()
         total_loss = 0
@@ -385,24 +413,32 @@ def train_model(
             del tensors, labels
         avg_train_loss = total_loss / len(train_loader)
         avg_eval_loss = evaluate_model(model, eval_loader, criterion)
-        if not deactivate_wandb:
-            wandb.log(
-                {
-                    "epoch": epoch + 1,
-                    "train_loss": avg_train_loss,
-                    "eval_loss": avg_eval_loss,
-                }
-            )
-        else:
-            print(
-                f"Epoch {epoch + 1}, Train Loss: {avg_train_loss:.4f}, Eval Loss: {avg_eval_loss:.4f}"
-            )
+        train_losses.append(avg_train_loss)
+        eval_losses.append(avg_eval_loss)
+        if (epoch + 1) % val_every == 0 or (epoch + 1) == epochs:
+            if not deactivate_wandb:
+                wandb.log(
+                    {
+                        "epoch": epoch + 1,
+                        "train_loss": avg_train_loss,
+                        "eval_loss": avg_eval_loss,
+                    }
+                )
+            else:
+                print(
+                    f"Epoch {epoch + 1}, Train Loss: {avg_train_loss:.4f}, Eval Loss: {avg_eval_loss:.4f}"
+                )
         # Save the best model
         if avg_eval_loss < best_eval_loss:
             best_eval_loss = avg_eval_loss
             torch.save(model.state_dict(), train_path)
     # Load the best model
     model.load_state_dict(torch.load(train_path))
+    if plot_path:
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=list(range(1, len(train_losses) + 1)), y=train_losses, mode="lines", name="train_loss"))
+        fig.add_trace(go.Scatter(x=list(range(1, len(eval_losses) + 1)), y=eval_losses, mode="lines+markers", name="val_loss"))
+        fig.write_html(plot_path)
 
 
 def train_models(
@@ -415,6 +451,8 @@ def train_models(
     epochs,
     train_pathes=["best_model1.pt", "best_model2.pt"],
     deactivate_wandb=False,
+    val_every=1,
+    plot_path=None,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     best_eval_loss1, best_eval_loss2 = float("inf"), float("inf")
@@ -424,6 +462,11 @@ def train_models(
     optimizer2 = optim.Adam(
         model2.parameters(), lr=optimizer.param_groups[0]["lr"]
     )
+    val_every = max(1, val_every)
+    train_losses1 = []
+    train_losses2 = []
+    eval_losses1 = []
+    eval_losses2 = []
     for epoch in range(epochs):
         model1.train()
         model2.train()
@@ -468,20 +511,25 @@ def train_models(
         avg_eval_loss1, avg_eval_loss2 = evaluate_models(
             model1, model2, eval_loader, criterion
         )
-        if not deactivate_wandb:
-            wandb.log(
-                {
-                    "epoch": epoch + 1,
-                    "train_loss_icl": avg_train_loss,
-                    "train_loss_zsl": avg_train_loss2,
-                    "eval_loss_icl": avg_eval_loss1,
-                    "eval_loss_zsl": avg_eval_loss2,
-                }
-            )
-        else:
-            print(
-                f"Epoch {epoch + 1}, Train Loss ICL: {avg_train_loss:.4f}, Train Loss ZSL: {avg_train_loss2:.4f}, Eval Loss ICL: {avg_eval_loss1:.4f}, Eval Loss ZSL: {avg_eval_loss2:.4f}"
-            )
+        train_losses1.append(avg_train_loss)
+        train_losses2.append(avg_train_loss2)
+        eval_losses1.append(avg_eval_loss1)
+        eval_losses2.append(avg_eval_loss2)
+        if (epoch + 1) % val_every == 0 or (epoch + 1) == epochs:
+            if not deactivate_wandb:
+                wandb.log(
+                    {
+                        "epoch": epoch + 1,
+                        "train_loss_icl": avg_train_loss,
+                        "train_loss_zsl": avg_train_loss2,
+                        "eval_loss_icl": avg_eval_loss1,
+                        "eval_loss_zsl": avg_eval_loss2,
+                    }
+                )
+            else:
+                print(
+                    f"Epoch {epoch + 1}, Train Loss ICL: {avg_train_loss:.4f}, Train Loss ZSL: {avg_train_loss2:.4f}, Eval Loss ICL: {avg_eval_loss1:.4f}, Eval Loss ZSL: {avg_eval_loss2:.4f}"
+                )
         # Save the best model
         if avg_eval_loss1 < best_eval_loss1:
             best_eval_loss1 = avg_eval_loss1
@@ -492,6 +540,13 @@ def train_models(
     # Load the best model
     model1.load_state_dict(torch.load(train_pathes[0]))
     model2.load_state_dict(torch.load(train_pathes[1]))
+    if plot_path:
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=list(range(1, len(train_losses1) + 1)), y=train_losses1, mode="lines", name="train_loss_icl"))
+        fig.add_trace(go.Scatter(x=list(range(1, len(eval_losses1) + 1)), y=eval_losses1, mode="lines+markers", name="val_loss_icl"))
+        fig.add_trace(go.Scatter(x=list(range(1, len(train_losses2) + 1)), y=train_losses2, mode="lines", name="train_loss_zsl"))
+        fig.add_trace(go.Scatter(x=list(range(1, len(eval_losses2) + 1)), y=eval_losses2, mode="lines+markers", name="val_loss_zsl"))
+        fig.write_html(plot_path)
 
 
 def evaluate_model(model, data_loader, criterion):
@@ -550,7 +605,7 @@ def calculate_task_accuracy(all_labels, all_preds, all_labels_ref):
     return task_accuracy
 
 
-def test_model(model, test_loader, deactivate_wandb=False, ts=None):
+def test_model(model, test_loader, deactivate_wandb=False, ts=None, args=None):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     model.eval()
@@ -593,6 +648,28 @@ def test_model(model, test_loader, deactivate_wandb=False, ts=None):
         )
     print(f"Test Accuracy: {accuracy:.4f}")
     print(f"Task Accuracy: {task_accuracy:.4f}")
+
+    # Optionally compute and print confidence intervals
+    if args is not None and getattr(args, "confidence_interval", False):
+        try:
+            from llava.eval.utils import bootstrap_confidence_interval
+        except ImportError:
+            from utils import bootstrap_confidence_interval
+        # Per-sample accuracy scores (1 if correct, 0 otherwise)
+        per_sample_acc = [1.0 if p == l else 0.0 for p, l in zip(all_preds, all_labels)]
+        acc_lo, acc_hi = bootstrap_confidence_interval(per_sample_acc)
+        print(f"Test Accuracy 95% CI: [{acc_lo:.4f}, {acc_hi:.4f}]")
+        # Per-sample task accuracy scores
+        per_sample_task = []
+        for i in range(len(all_preds)):
+            if all_labels[i] == 1 and all_preds[i] == 1:
+                per_sample_task.append(1.0)
+            elif all_labels_ref and all_labels_ref[i] == 1 and all_preds[i] == 0:
+                per_sample_task.append(1.0)
+            else:
+                per_sample_task.append(0.0)
+        task_lo, task_hi = bootstrap_confidence_interval(per_sample_task)
+        print(f"Task Accuracy 95% CI: [{task_lo:.4f}, {task_hi:.4f}]")
 
 
 def calculate_dual_accuracy(all_labels, all_labels_ref, all_preds1, all_preds2):
@@ -677,6 +754,44 @@ def test_models(model1, model2, test_loader, deactivate_wandb=False, ts=None, ar
     print(f"Test Accuracy (ref): {accuracy_ref:.4f}")
     print(f"Model Accuracy: {model_accuracy:.4f}")
     print(f"Task Accuracy: {task_accuracy:.4f}")
+
+    # Optionally compute and print confidence intervals
+    if args is not None and getattr(args, "confidence_interval", False):
+        try:
+            from llava.eval.utils import bootstrap_confidence_interval
+        except ImportError:
+            from utils import bootstrap_confidence_interval
+        # Per-sample accuracy scores
+        per_sample_acc = [1.0 if p == l else 0.0 for p, l in zip(all_preds1, all_labels)]
+        acc_lo, acc_hi = bootstrap_confidence_interval(per_sample_acc)
+        print(f"Test Accuracy 95% CI: [{acc_lo:.4f}, {acc_hi:.4f}]")
+        per_sample_acc_ref = [1.0 if p == l else 0.0 for p, l in zip(all_preds2, all_labels_ref)]
+        acc_ref_lo, acc_ref_hi = bootstrap_confidence_interval(per_sample_acc_ref)
+        print(f"Test Accuracy (ref) 95% CI: [{acc_ref_lo:.4f}, {acc_ref_hi:.4f}]")
+        # Per-sample model accuracy scores
+        per_sample_model = []
+        for i in range(len(all_preds1)):
+            if all_labels[i] == 1 and all_preds1[i] == 1:
+                per_sample_model.append(1.0)
+            elif all_labels_ref[i] == 1 and all_preds2[i] == 1:
+                per_sample_model.append(1.0)
+            elif all_labels[i] == 0 and all_preds1[i] == 0:
+                per_sample_model.append(1.0)
+            else:
+                per_sample_model.append(0.0)
+        model_lo, model_hi = bootstrap_confidence_interval(per_sample_model)
+        print(f"Model Accuracy 95% CI: [{model_lo:.4f}, {model_hi:.4f}]")
+        # Per-sample task accuracy scores
+        per_sample_task = []
+        for i in range(len(all_preds1)):
+            if all_labels[i] == 1 and all_preds1[i] == 1:
+                per_sample_task.append(1.0)
+            elif all_labels_ref[i] == 1 and all_preds2[i] == 1:
+                per_sample_task.append(1.0)
+            else:
+                per_sample_task.append(0.0)
+        task_lo, task_hi = bootstrap_confidence_interval(per_sample_task)
+        print(f"Task Accuracy 95% CI: [{task_lo:.4f}, {task_hi:.4f}]")
 
 
 def label_intersection(labels1, labels2, tensor_dir):
@@ -871,54 +986,122 @@ def main():
                     "model_prefix": f"{ts}_{args.prefix}{args.model}"
                 },
             )
-        # Paths for the CSV files
-        csv_file1 = os.path.join(
-            args.result_dir, args.task, f"{args.prefix}{args.model}.csv"
-        )
-        csv_file2 = os.path.join(args.result_dir, args.task, f"{args.model}.csv")
-        # Load labels from both CSV files as string labels
-        labels1 = load_original_labels(csv_file1)
-        labels2 = load_original_labels(csv_file2)
-        # Paths for the tensor files
-        tensor_dir = os.path.join(
-            args.intermediate_dir,
-            "eval",
-            args.task,
-            "intermediate",
-            f"{args.prefix}{args.model}",
-        )
-        # Label the data based on the intersection of labels / single source
-        labels, labels_ref = label_data(
-            labels1,
-            labels2,
-            label_type=args.label_type,
-            tensor_dir=tensor_dir,
-            sample_num=args.num_samples if args.do_sample else None,
-        )
-        # Use only the mismatched IDs
-        all_ids = list(labels.keys())
-        if len(all_ids) == 0:
-            print("No mismatched records found between the two CSV files.")
-            return
-        print(f"Found {len(all_ids)} records.")
-        # Create dataset using mismatched labels
-        dataset = TensorDataset(
-            all_ids, labels, labels_ref, tensor_dir, probe_type=args.probe_type
-        )
-        filtered_ids = dataset.ids
+        use_separate_train = args.train_tensor_dir is not None
 
-        # Split IDs into train, eval, and test sets
-        train_ids, eval_ids, test_ids = split_data(filtered_ids, labels=labels)
-        # Create datasets and loaders
-        train_dataset = TensorDataset(
-            train_ids, labels, labels_ref, tensor_dir, probe_type=args.probe_type
-        )
-        eval_dataset = TensorDataset(
-            eval_ids, labels, labels_ref, tensor_dir, probe_type=args.probe_type
-        )
-        test_dataset = TensorDataset(
-            test_ids, labels, labels_ref, tensor_dir, probe_type=args.probe_type
-        )
+        if use_separate_train:
+            # --- USE_TRAIN_TO_SELECT mode: separate train & test data ---
+            print("Using separate training data for probe (USE_TRAIN_TO_SELECT mode)")
+            # Load training labels
+            train_labels1 = load_original_labels(args.train_csv_file1)
+            train_labels2 = load_original_labels(args.train_csv_file2)
+            train_labels, train_labels_ref = label_data(
+                train_labels1,
+                train_labels2,
+                label_type=args.label_type,
+                tensor_dir=args.train_tensor_dir,
+                sample_num=args.num_samples if args.do_sample else None,
+            )
+            train_all_ids = list(train_labels.keys())
+            if len(train_all_ids) == 0:
+                print("No records found in training data.")
+                return
+            print(f"Found {len(train_all_ids)} training records.")
+            # Create full training dataset (filters to IDs with tensors)
+            train_full_dataset = TensorDataset(
+                train_all_ids, train_labels, train_labels_ref, args.train_tensor_dir, probe_type=args.probe_type
+            )
+            train_filtered_ids = train_full_dataset.ids
+            # Split training data 90/10 into train/eval
+            random.shuffle(train_filtered_ids)
+            split_point = int(0.9 * len(train_filtered_ids))
+            train_ids = train_filtered_ids[:split_point]
+            eval_ids = train_filtered_ids[split_point:]
+            train_dataset = TensorDataset(
+                train_ids, train_labels, train_labels_ref, args.train_tensor_dir, probe_type=args.probe_type
+            )
+            eval_dataset = TensorDataset(
+                eval_ids, train_labels, train_labels_ref, args.train_tensor_dir, probe_type=args.probe_type
+            )
+            # Load test labels (full eval split)
+            test_csv1 = args.test_csv_file1 or os.path.join(
+                args.result_dir, args.task, f"{args.prefix}{args.model}.csv"
+            )
+            test_csv2 = args.test_csv_file2 or os.path.join(
+                args.result_dir, args.task, f"{args.model}.csv"
+            )
+            test_tensor_dir = args.test_tensor_dir or os.path.join(
+                args.intermediate_dir, "eval", args.task, "intermediate",
+                f"{args.prefix}{args.model}",
+            )
+            test_labels1 = load_original_labels(test_csv1)
+            test_labels2 = load_original_labels(test_csv2)
+            test_labels, test_labels_ref = label_data(
+                test_labels1,
+                test_labels2,
+                label_type=args.label_type,
+                tensor_dir=test_tensor_dir,
+                sample_num=None,  # Use ALL eval data for testing
+            )
+            test_all_ids = list(test_labels.keys())
+            test_dataset = TensorDataset(
+                test_all_ids, test_labels, test_labels_ref, test_tensor_dir, probe_type=args.probe_type
+            )
+            print(f"Test set: {len(test_dataset)} records (full eval split)")
+            # For model initialization, use train dataset
+            tensor_dir = args.train_tensor_dir
+            filtered_ids = train_filtered_ids
+            labels = train_labels
+            labels_ref = train_labels_ref
+        else:
+            # --- Original mode: single data source with 80/10/10 split ---
+            # Paths for the CSV files
+            csv_file1 = os.path.join(
+                args.result_dir, args.task, f"{args.prefix}{args.model}.csv"
+            )
+            csv_file2 = os.path.join(args.result_dir, args.task, f"{args.model}.csv")
+            # Load labels from both CSV files as string labels
+            labels1 = load_original_labels(csv_file1)
+            labels2 = load_original_labels(csv_file2)
+            # Paths for the tensor files
+            tensor_dir = os.path.join(
+                args.intermediate_dir,
+                "eval",
+                args.task,
+                "intermediate",
+                f"{args.prefix}{args.model}",
+            )
+            # Label the data based on the intersection of labels / single source
+            labels, labels_ref = label_data(
+                labels1,
+                labels2,
+                label_type=args.label_type,
+                tensor_dir=tensor_dir,
+                sample_num=args.num_samples if args.do_sample else None,
+            )
+            # Use only the mismatched IDs
+            all_ids = list(labels.keys())
+            if len(all_ids) == 0:
+                print("No mismatched records found between the two CSV files.")
+                return
+            print(f"Found {len(all_ids)} records.")
+            # Create dataset using mismatched labels
+            dataset = TensorDataset(
+                all_ids, labels, labels_ref, tensor_dir, probe_type=args.probe_type
+            )
+            filtered_ids = dataset.ids
+
+            # Split IDs into train, eval, and test sets
+            train_ids, eval_ids, test_ids = split_data(filtered_ids, labels=labels)
+            # Create datasets and loaders
+            train_dataset = TensorDataset(
+                train_ids, labels, labels_ref, tensor_dir, probe_type=args.probe_type
+            )
+            eval_dataset = TensorDataset(
+                eval_ids, labels, labels_ref, tensor_dir, probe_type=args.probe_type
+            )
+            test_dataset = TensorDataset(
+                test_ids, labels, labels_ref, tensor_dir, probe_type=args.probe_type
+            )
         num_positive_train = sum(
             1 for label in train_dataset.labels.values() if label == 1
         )
@@ -995,18 +1178,37 @@ def main():
             input_size = example_tensor.numel()
             model = SimpleClassifier(input_size=input_size, num_classes=2)
         # Create DataLoaders
-        train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
-        eval_loader = DataLoader(eval_dataset, batch_size=args.batch_size)
-        test_loader = DataLoader(test_dataset, batch_size=args.batch_size)
-        print("DataLoaders created with batch size:", args.batch_size)
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+        )
+        eval_loader = DataLoader(
+            eval_dataset,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+        )
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+        )
+        print(
+            "DataLoaders created with batch size:",
+            args.batch_size,
+            "num_workers:",
+            args.num_workers,
+        )
         # Define the criterion and optimizer
         if args.weight_loss:
             if args.deactivate_wandb:
                 print(f"Using class weights: {args.positive_weight}")
             else:
                 wandb.log({"positive_weight": args.positive_weight})
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             class_weights = torch.tensor(
-                [1.0, args.positive_weight]
+                [1.0, args.positive_weight], device=device
             )
         else:
             class_weights = None
@@ -1051,6 +1253,11 @@ def main():
             args.task,
             f"{ts}_{args.prefix}{args.model}_trained.pt",
         )
+        loss_plot_path = os.path.join(
+            args.result_dir,
+            args.task,
+            f"{ts}_{args.prefix}{args.model}_loss_plot.html",
+        )
         if args.label_type == "both":
             # copy model1 / prep path2
             model2 = deepcopy(model)
@@ -1058,6 +1265,11 @@ def main():
                 args.result_dir,
                 args.task,
                 f"{ts}_{args.prefix}{args.model}_trained_ref.pt",
+            )
+            loss_plot_path = os.path.join(
+                args.result_dir,
+                args.task,
+                f"{ts}_{args.prefix}{args.model}_loss_plot.html",
             )
             # Train both models
             train_models(
@@ -1070,6 +1282,8 @@ def main():
                 args.epochs,
                 train_pathes=[save_path, save_path2],
                 deactivate_wandb=args.deactivate_wandb,
+                val_every=args.probe_val_epoch,
+                plot_path=loss_plot_path,
             )
         else:
             train_model(
@@ -1081,6 +1295,8 @@ def main():
                 args.epochs,
                 train_path=save_path,
                 deactivate_wandb=args.deactivate_wandb,
+                val_every=args.probe_val_epoch,
+                plot_path=loss_plot_path,
             )
         print("Model training completed.")
         # Save the model
@@ -1111,49 +1327,87 @@ def main():
         print("Model testing completed.")
     else:
         # Load the test data
-        # Paths for the CSV files
-        csv_file1 = os.path.join(
-            args.result_dir, args.task, f"{args.prefix}{args.model}.csv"
-        )
-        csv_file2 = os.path.join(args.result_dir, args.task, f"{args.model}.csv")
-        # Load labels from both CSV files as string labels
-        labels1 = load_original_labels(csv_file1)
-        labels2 = load_original_labels(csv_file2)
-        # Paths for the tensor files
-        tensor_dir = os.path.join(
-            args.intermediate_dir,
-            "eval",
-            args.task,
-            "intermediate",
-            f"{args.prefix}{args.model}",
-        )
-        # Label the data based on the intersection of labels / single source
-        labels, labels_ref = label_data(
-            labels1,
-            labels2,
-            label_type=args.label_type,
-            tensor_dir=tensor_dir,
-            sample_num=args.num_samples if args.do_sample else None,
-        )
-        print(f"Data labeled with {args.label_type} method.")
-        # Use only the mismatched IDs
-        all_ids = list(labels.keys())
-        # Create dataset using mismatched labels
-        dataset = TensorDataset(
-            all_ids, labels, labels_ref, tensor_dir, probe_type=args.probe_type
-        )
-        filtered_ids = dataset.ids
-        print(f"Dataset created with {len(filtered_ids)} records.")
+        use_separate_test = args.test_tensor_dir is not None
 
-        # Split IDs into train, eval, and test sets
-        _, _, test_ids = split_data(filtered_ids, labels=labels)
-        # Create datasets and loaders
-        test_dataset = TensorDataset(
-            test_ids, labels, labels_ref, tensor_dir, probe_type=args.probe_type
-        )
+        if use_separate_test:
+            # --- USE_TRAIN_TO_SELECT mode: test on full eval split ---
+            print("Using separate test data for probe (USE_TRAIN_TO_SELECT mode)")
+            test_csv1 = args.test_csv_file1 or os.path.join(
+                args.result_dir, args.task, f"{args.prefix}{args.model}.csv"
+            )
+            test_csv2 = args.test_csv_file2 or os.path.join(
+                args.result_dir, args.task, f"{args.model}.csv"
+            )
+            tensor_dir = args.test_tensor_dir
+            labels1 = load_original_labels(test_csv1)
+            labels2 = load_original_labels(test_csv2)
+            labels, labels_ref = label_data(
+                labels1,
+                labels2,
+                label_type=args.label_type,
+                tensor_dir=tensor_dir,
+                sample_num=None,  # Use ALL eval data
+            )
+            all_ids = list(labels.keys())
+            test_dataset = TensorDataset(
+                all_ids, labels, labels_ref, tensor_dir, probe_type=args.probe_type
+            )
+            filtered_ids = test_dataset.ids
+            print(f"Test set: {len(test_dataset)} records (full eval split)")
+        else:
+            # --- Original mode: split and use 10% test set ---
+            # Paths for the CSV files
+            csv_file1 = os.path.join(
+                args.result_dir, args.task, f"{args.prefix}{args.model}.csv"
+            )
+            csv_file2 = os.path.join(args.result_dir, args.task, f"{args.model}.csv")
+            # Load labels from both CSV files as string labels
+            labels1 = load_original_labels(csv_file1)
+            labels2 = load_original_labels(csv_file2)
+            # Paths for the tensor files
+            tensor_dir = os.path.join(
+                args.intermediate_dir,
+                "eval",
+                args.task,
+                "intermediate",
+                f"{args.prefix}{args.model}",
+            )
+            # Label the data based on the intersection of labels / single source
+            labels, labels_ref = label_data(
+                labels1,
+                labels2,
+                label_type=args.label_type,
+                tensor_dir=tensor_dir,
+                sample_num=args.num_samples if args.do_sample else None,
+            )
+            print(f"Data labeled with {args.label_type} method.")
+            # Use only the mismatched IDs
+            all_ids = list(labels.keys())
+            # Create dataset using mismatched labels
+            dataset = TensorDataset(
+                all_ids, labels, labels_ref, tensor_dir, probe_type=args.probe_type
+            )
+            filtered_ids = dataset.ids
+            print(f"Dataset created with {len(filtered_ids)} records.")
+
+            # Split IDs into train, eval, and test sets
+            _, _, test_ids = split_data(filtered_ids, labels=labels)
+            # Create datasets and loaders
+            test_dataset = TensorDataset(
+                test_ids, labels, labels_ref, tensor_dir, probe_type=args.probe_type
+            )
         # Create DataLoaders
-        test_loader = DataLoader(test_dataset, batch_size=args.batch_size)
-        print("DataLoader created with batch size:", args.batch_size)
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+        )
+        print(
+            "DataLoader created with batch size:",
+            args.batch_size,
+            "num_workers:",
+            args.num_workers,
+        )
 
         # Determine input size using an example tensor
         example_id = filtered_ids[0]

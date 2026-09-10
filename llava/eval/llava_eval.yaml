@@ -1,5 +1,7 @@
 # LLaVA eval config
-root_path: /home/s2140401/script/memes_xai/models/LLaVA/playground/data/eval
+# root_path is overridden by --root-path command line argument in analyze_dataset.sh
+# Default placeholder (will be replaced at runtime):
+root_path: ${LLAVA_DIR}/playground/data/eval
 GQA:
   prefix: gqa
   questions: llava_gqa_testdev_balanced.jsonl
@@ -39,6 +41,22 @@ VizWiz:
   id_col: question_id
   eval_type: model_vqa_loader
   image_folder: eval/vizwiz/test
+GQA_train_selector:
+  prefix: gqa
+  questions: llava_gqa_train_selector.jsonl
+  text_col: text
+  image_col: image
+  id_col: question_id
+  eval_type: model_vqa_loader
+  image_folder: eval/gqa/data/images
+TextVQA_train_selector:
+  prefix: textvqa
+  questions: llava_textvqa_train_selector.jsonl
+  text_col: text
+  image_col: image
+  id_col: question_id
+  eval_type: model_vqa_loader
+  image_folder: eval/textvqa/train_images
 VQAv2:
   prefix: vqav2
   questions: llava_vqav2_mscoco_test-dev2015.jsonl

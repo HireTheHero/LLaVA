@@ -36,3 +36,6 @@ ckpts*
 
 # Demo
 serve_images/
+
+# Bug artifact: runs with unset export_path wrote here
+None/

@@ -7,9 +7,41 @@ import math
 from pathlib import Path
 from typing import Any, Dict, List, Union
 
+import numpy as np
 import pandas as pd
 import torch
 from transformers.generation.utils import GreedySearchOutput
+
+
+def bootstrap_confidence_interval(scores, n_bootstrap=1000, confidence=0.95, seed=42):
+    """Compute bootstrap confidence interval for the mean of *scores*.
+
+    Parameters
+    ----------
+    scores : array-like
+        Per-sample metric values (e.g. 0/1 for accuracy).
+    n_bootstrap : int
+        Number of bootstrap resamples.
+    confidence : float
+        Confidence level (default 95 %).
+    seed : int
+        Random seed for reproducibility.
+
+    Returns
+    -------
+    (lower, upper) : tuple of float
+        Lower and upper bounds of the confidence interval.
+    """
+    scores = np.asarray(scores, dtype=float)
+    rng = np.random.RandomState(seed)
+    n = len(scores)
+    boot_means = np.array(
+        [np.mean(rng.choice(scores, size=n, replace=True)) for _ in range(n_bootstrap)]
+    )
+    alpha = (1 - confidence) / 2
+    lower = float(np.percentile(boot_means, alpha * 100))
+    upper = float(np.percentile(boot_means, (1 - alpha) * 100))
+    return lower, upper
 
 def read_json(
     file: str,
@@ -141,17 +173,43 @@ def add_image_token(
     answer_col: str = "answer",
 ):
     """
-    Add image token to the llava format question
+    Add image token to the llava format question.
+
+    For multi-input (ICL) entries the ``__sep__``-delimited fields may
+    contain K+1 parts (K ICL references + 1 query).  The function
+    returns:
+      - ``qs``:  list of K+1 processed question strings
+      - ``ans``: list of K reference answer strings (or a single string
+        for legacy 1-shot)
+      - ``image_file``: list of K+1 image paths
     """
     image_token_se = default_im_start_token + default_image_token + default_im_end_token
     if is_multiple_questions:
-        train_file, eval_file = line[image_col].split(args.sep)
-        train_path_or_str = train_file if not train_file.endswith(".jpg") and not train_file.endswith(".png") else f"{args.train_path}/{train_file}"
-        image_file = [train_path_or_str, eval_file]
+        img_parts = line[image_col].split(args.sep)
+        # parts[:-1] = ICL reference images, parts[-1] = query image
+        image_file = []
+        for f in img_parts[:-1]:
+            if f.endswith(".jpg") or f.endswith(".png"):
+                image_file.append(f"{args.train_path}/{f}")
+            else:
+                image_file.append(f)
+        image_file.append(img_parts[-1])  # query image (relative to image_folder)
+
         texts = line[text_col].split(args.sep)
-        assert len(texts) == 2, "When multiple questions option is set, the entry must have 2 questions"
+        assert len(texts) >= 2, (
+            f"When multiple questions option is set, the entry must have "
+            f"at least 2 parts (got {len(texts)})"
+        )
         assert answer_col in line, "When multiple questions option is set, first question must have answer"
-        ans = line[answer_col]
+
+        # Parse K reference answers (may be __sep__-delimited or a single string)
+        raw_ans = line[answer_col]
+        if args.sep in str(raw_ans):
+            ans = raw_ans.split(args.sep)  # list of K answers
+        else:
+            ans = [raw_ans]  # legacy 1-shot: single answer string in a list
+
+        # Replace image placeholder in every text part
         if image_placeholder in texts[0]:
             if model_config.mm_use_im_start_end:
                 qs = [text.replace(image_placeholder, image_token_se) for text in texts]
@@ -178,11 +236,32 @@ def add_image_token(
                 qs = default_image_token + '\n' + qs
     return qs, ans, image_file
 
-def append_message(conv, qs: Union[str, List[str]], is_multiple_questions: bool, ans: str = None):
+def append_message(conv, qs: Union[str, List[str]], is_multiple_questions: bool, ans: Union[str, List[str], None] = None):
+    """Format a conversation with optional ICL demonstrations.
+
+    For multi-input (ICL) entries, ``qs`` is a list of K+1 strings
+    (K reference questions followed by the query) and ``ans`` is a list
+    of K reference answers (or a single answer string for legacy 1-shot).
+    """
     if is_multiple_questions:
-        first_conv = (qs[0], conv.roles[1], ans)
-        qs = (conv.roles[0], qs[1])
-        conditioned_qs = "\n".join(first_conv+qs)
+        # Normalise ans to a list so both legacy (str) and K-shot (list) work
+        if isinstance(ans, str):
+            ans_list = [ans]
+        elif ans is None:
+            ans_list = []
+        else:
+            ans_list = list(ans)
+
+        # qs = [ref1_q, ref2_q, ..., refK_q, query_q]
+        # ans_list = [ref1_a, ref2_a, ..., refK_a]
+        parts = []
+        for i, ref_q in enumerate(qs[:-1]):
+            parts.append(ref_q)
+            parts.append(conv.roles[1])
+            parts.append(ans_list[i] if i < len(ans_list) else "")
+            parts.append(conv.roles[0])
+        parts.append(qs[-1])  # query
+        conditioned_qs = "\n".join(parts)
         conv.append_message(conv.roles[0], conditioned_qs)
         conv.append_message(conv.roles[1], None)
     else:

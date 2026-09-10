@@ -4,7 +4,12 @@ import gzip
 from itertools import product
 import json
 import os
+import sys
 from pathlib import Path
+
+# Ensure sibling modules (representation_learning, utils) are importable
+# regardless of the working directory (e.g. when invoked via python -m from $LLAVA_DIR).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import pickle
 from pprint import pprint
 from typing import Dict, List, Optional, Tuple
@@ -2208,15 +2213,57 @@ def _compute_outputs_for_qid(
     return zsl_outputs_rand, zsl_outputs, icl_outputs_rand, icl_outputs_sem
 
 
+def _load_preextracted_embeddings(preextracted_dir, logger=None):
+    """Load pre-extracted mean-pooled hidden states from Phase 2 output.
+
+    Scans ``preextracted_dir`` for ``four_proj_{condition}_{index}_{qid}.pt.gz``
+    files and returns them as a list of 4-tuples ordered by index.
+    """
+    import re as _re
+
+    pattern = _re.compile(r"four_proj_(zsl_rand|zsl_sem|icl_rand|icl_sem)_(\d+)_(.+)\.pt\.gz")
+    found: Dict[int, Dict[str, torch.Tensor]] = {}
+    for fname in os.listdir(preextracted_dir):
+        m = pattern.match(fname)
+        if m:
+            cond, idx_str, _qid = m.groups()
+            idx = int(idx_str)
+            if idx not in found:
+                found[idx] = {}
+            with gzip.open(os.path.join(preextracted_dir, fname), "rb") as f:
+                found[idx][cond] = torch.load(f, map_location="cpu")
+
+    embeddings = []
+    for idx in sorted(found.keys()):
+        d = found[idx]
+        if len(d) != 4:
+            if logger:
+                logger.warning(f"Skipping index {idx}: only {len(d)}/4 conditions found")
+            continue
+        embeddings.append((d["zsl_rand"], d["zsl_sem"], d["icl_rand"], d["icl_sem"]))
+
+    if logger:
+        logger.info(f"Loaded {len(embeddings)} pre-extracted embedding tuples from {preextracted_dir}")
+    return embeddings
+
+
 def train(
     args: argparse.Namespace,
-    dataset: QIDDataset,
-    tokenizer: PreTrainedTokenizer,
-    llava_model: LlavaLlamaForCausalLM,
-    device: torch.device,
+    dataset=None,
+    tokenizer=None,
+    llava_model=None,
+    device: torch.device = None,
     logger=None,
 ):
-    """Train the FourSpaceProjector on all dataset entries."""
+    """Train the FourSpaceProjector on all dataset entries.
+
+    When ``args.preextracted_dir`` is set, loads pre-extracted mean-pooled
+    hidden states from disk (no LLaVA model required).  Otherwise falls back
+    to the original behaviour of running forward passes through the model.
+    """
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     config = CustomModelConfig()
     probe = FourSpaceProjector(
         hidden_size=config.embed_dim,
@@ -2224,60 +2271,82 @@ def train(
         gate="scalar",
         init="xavier_uniform",
     ).to(device)
-    if args.debug:
-        logger.info("Debug mode enabled")
-        dataset.qids = dataset.qids[: args.sample_index+10]
-    logger.info(f"Training on {len(dataset)} samples")
 
-    loader = DataLoader(
-        dataset,
-        batch_size=args.forward_batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        collate_fn=collate_qid_batch,
-    )
+    preextracted_dir = getattr(args, "preextracted_dir", None)
 
-    embeddings = []
-    for batch in loader:
-        zsl_inputs = batch["zsl_rand"] + batch["zsl_sem"]
-        icl_inputs = batch["icl_rand"] + batch["icl_sem"]
-
-        zsl_hidden = forward_hidden_states_batch(
-            zsl_inputs, llava_model, tokenizer, device
-        )
-        del zsl_inputs
-        if torch.cuda.is_available():
-            zsl_hidden = zsl_hidden.cpu()
-        free_memory()
-        icl_hidden = forward_hidden_states_batch(
-            icl_inputs, llava_model, tokenizer, device
-        )
-        del icl_inputs
-        if torch.cuda.is_available():
-            icl_hidden = icl_hidden.cpu()
-        free_memory()
-
-        bsz = len(batch["zsl_rand"])
-        for i in range(bsz):
-            zsl_rand_h = zsl_hidden[2 * i : 2 * i + 1]
-            zsl_sem_h = zsl_hidden[2 * i + 1 : 2 * i + 2]
-            icl_rand_h = icl_hidden[2 * i : 2 * i + 1]
-            icl_sem_h = icl_hidden[2 * i + 1 : 2 * i + 2]
-
-            def _agg(h):
-                return h.mean(dim=1).squeeze(0).to(torch.float32).cpu()
-
-            embeddings.append(
-                (
-                    _agg(zsl_rand_h),
-                    _agg(zsl_sem_h),
-                    _agg(icl_rand_h),
-                    _agg(icl_sem_h),
-                )
+    if preextracted_dir is not None:
+        # ---- Load pre-extracted embeddings (no model needed) ----
+        embeddings = _load_preextracted_embeddings(preextracted_dir, logger)
+        if args.debug:
+            if logger:
+                logger.info("Debug mode enabled")
+            embeddings = embeddings[: args.sample_index + 10]
+        if logger:
+            logger.info(f"Training on {len(embeddings)} pre-extracted samples")
+    else:
+        # ---- Original: extract embeddings via forward passes ----
+        if dataset is None or llava_model is None or tokenizer is None:
+            raise ValueError(
+                "dataset, llava_model, and tokenizer are required when "
+                "--preextracted-dir is not set"
             )
-        free_memory()
-    logger.info(f"Finished processing {len(dataset)} samples")
+        if args.debug:
+            if logger:
+                logger.info("Debug mode enabled")
+            dataset.qids = dataset.qids[: args.sample_index + 10]
+        if logger:
+            logger.info(f"Training on {len(dataset)} samples")
+
+        loader = DataLoader(
+            dataset,
+            batch_size=args.forward_batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            collate_fn=collate_qid_batch,
+        )
+
+        embeddings = []
+        for batch in loader:
+            zsl_inputs = batch["zsl_rand"] + batch["zsl_sem"]
+            icl_inputs = batch["icl_rand"] + batch["icl_sem"]
+
+            zsl_hidden = forward_hidden_states_batch(
+                zsl_inputs, llava_model, tokenizer, device
+            )
+            del zsl_inputs
+            if torch.cuda.is_available():
+                zsl_hidden = zsl_hidden.cpu()
+            free_memory()
+            icl_hidden = forward_hidden_states_batch(
+                icl_inputs, llava_model, tokenizer, device
+            )
+            del icl_inputs
+            if torch.cuda.is_available():
+                icl_hidden = icl_hidden.cpu()
+            free_memory()
+
+            bsz = len(batch["zsl_rand"])
+            for i in range(bsz):
+                zsl_rand_h = zsl_hidden[2 * i : 2 * i + 1]
+                zsl_sem_h = zsl_hidden[2 * i + 1 : 2 * i + 2]
+                icl_rand_h = icl_hidden[2 * i : 2 * i + 1]
+                icl_sem_h = icl_hidden[2 * i + 1 : 2 * i + 2]
+
+                def _agg(h):
+                    return h.mean(dim=1).squeeze(0).to(torch.float32).cpu()
+
+                embeddings.append(
+                    (
+                        _agg(zsl_rand_h),
+                        _agg(zsl_sem_h),
+                        _agg(icl_rand_h),
+                        _agg(icl_sem_h),
+                    )
+                )
+            free_memory()
+        if logger:
+            logger.info(f"Finished processing {len(dataset)} samples")
 
     optimizer = torch.optim.Adam(probe.parameters(), lr=1e-3)
     best_loss = float("inf")
@@ -2980,6 +3049,722 @@ def eval_global(
         logger.info(f"Ablated analysis saved to: {ablated_save_dir}")
 
 
+# ---------------------------------------------------------------------------
+# Causal subspace intervention
+# ---------------------------------------------------------------------------
+
+def _make_random_projection(weight: torch.Tensor, seed: int = 0) -> nn.Linear:
+    """Create a random orthogonal projection with the same shape as *weight*.
+
+    The random matrix is produced via QR decomposition of a Gaussian random
+    matrix, giving a uniformly random orthogonal matrix that serves as a
+    control for the learned projections.
+
+    Parameters
+    ----------
+    weight : torch.Tensor
+        Reference weight tensor whose shape ``[out, in]`` is replicated.
+    seed : int
+        Random seed for reproducibility.
+
+    Returns
+    -------
+    nn.Linear
+        A frozen ``nn.Linear`` layer (no bias) with an orthogonal weight.
+    """
+    rng = torch.Generator()
+    rng.manual_seed(seed)
+    rand_mat = torch.randn(weight.shape, generator=rng, dtype=weight.dtype)
+    q, _ = torch.linalg.qr(rand_mat)
+    layer = nn.Linear(weight.shape[1], weight.shape[0], bias=False)
+    layer.weight.data.copy_(q)
+    layer.requires_grad_(False)
+    return layer.to(weight.device)
+
+
+def _compute_logits(hidden: torch.Tensor, model: LlavaLlamaForCausalLM) -> torch.Tensor:
+    """Compute lm_head logits for every position in *hidden*.
+
+    Parameters
+    ----------
+    hidden : torch.Tensor
+        Shape ``[batch, seq_len, hidden_dim]``.
+
+    Returns
+    -------
+    torch.Tensor
+        Logits of shape ``[batch, seq_len, vocab_size]``.
+    """
+    with torch.inference_mode():
+        lm_device = model.lm_head.weight.device
+        lm_dtype = model.lm_head.weight.dtype
+        h = hidden.to(device=lm_device, dtype=lm_dtype)
+        logits = model.lm_head(h)
+    return logits
+
+
+def generate_with_ablation(
+    model: LlavaLlamaForCausalLM,
+    tokenizer: PreTrainedTokenizer,
+    input_ids: torch.Tensor,
+    images: torch.Tensor,
+    ablate_fn,
+    max_new_tokens: int = 128,
+    temperature: float = 0.0,
+    prefill_only: bool = True,
+    conv_mode: str = "llava_v1",
+) -> str:
+    """Generate a VQA answer with a hidden-state ablation hook.
+
+    Parameters
+    ----------
+    model : LlavaLlamaForCausalLM
+        The LLaVA model.
+    tokenizer : PreTrainedTokenizer
+        Tokenizer for decoding.
+    input_ids : torch.Tensor
+        Shape ``[1, seq_len]``.
+    images : torch.Tensor
+        Processed image tensor(s).
+    ablate_fn : callable
+        ``hidden -> ablated_hidden``.  Applied to the output of the last
+        transformer layer before it reaches ``lm_head``.
+    max_new_tokens : int
+        Maximum number of tokens to generate.
+    temperature : float
+        Sampling temperature.  0 = greedy.
+    prefill_only : bool
+        If *True*, the hook only fires during the prefill step (when
+        ``seq_len > 1``) and leaves per-token generation steps unmodified.
+    conv_mode : str
+        Conversation template name (used for stop-string detection).
+
+    Returns
+    -------
+    str
+        The decoded answer text.
+    """
+    device = next(model.parameters()).device
+    model_dtype = next(model.parameters()).dtype
+
+    def hook_fn(module, inp, output):
+        h = output[0]  # [batch, seq, hidden_dim]
+        if prefill_only and h.shape[1] == 1:
+            return output
+        h_ablated = ablate_fn(h)
+        return (h_ablated,) + output[1:]
+
+    target_layer = model.model.layers[-1]
+    handle = target_layer.register_forward_hook(hook_fn)
+    try:
+        with torch.inference_mode():
+            outputs = model.generate(
+                input_ids.to(device),
+                images=images.to(dtype=model_dtype, device=device, non_blocking=True),
+                do_sample=temperature > 0,
+                temperature=temperature if temperature > 0 else 1.0,
+                max_new_tokens=max_new_tokens,
+                use_cache=True,
+            )
+    finally:
+        handle.remove()
+
+    # Decode
+    generated_ids = outputs[0][input_ids.shape[1]:]
+    text = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+    stop_str = (
+        conv_templates[conv_mode].sep
+        if conv_templates[conv_mode].sep_style != SeparatorStyle.TWO
+        else conv_templates[conv_mode].sep2
+    )
+    if text.endswith(stop_str):
+        text = text[: -len(stop_str)].strip()
+    return text
+
+
+def eval_causal_intervention(
+    args: argparse.Namespace,
+    dataset: "QIDDataset",
+    tokenizer: PreTrainedTokenizer,
+    llava_model: LlavaLlamaForCausalLM,
+    probe: FourSpaceProjector,
+    device: torch.device,
+    logger=None,
+    n_samples: int = 100,
+):
+    """Ablate semantic / statistical / ICL subspaces and measure impact.
+
+    For each sample and each of the four conditions (zsl_rand, zsl_sem,
+    icl_rand, icl_sem) we:
+
+    1. Run a forward pass to obtain the last-layer hidden state *h*.
+    2. Compute five variants of *h* (original, no_semantic, no_statistical,
+       no_icl, random).
+    3. Measure cosine similarity, token agreement, and KL divergence
+       between the original and each ablated variant.
+    4. Aggregate across samples and perform paired Wilcoxon tests.
+    5. Save JSON results and a Plotly summary chart.
+    """
+
+    CONDITION_KEYS = ["zsl_rand", "zsl_sem", "icl_rand", "icl_sem"]
+
+    save_dir = os.path.join(args.exp_dir, "causal")
+    os.makedirs(save_dir, exist_ok=True)
+
+    # --- Build ablation functions ----
+    probe_dtype = next(probe.parameters()).dtype
+    probe_device = next(probe.parameters()).device
+    random_proj = _make_random_projection(
+        probe.proj_h2.weight, seed=args.seed if hasattr(args, "seed") else 42
+    )
+
+    def _to_probe(h: torch.Tensor) -> torch.Tensor:
+        return h.to(device=probe_device, dtype=probe_dtype)
+
+    ablation_modes = {
+        "original":       lambda h: h,
+        "no_semantic":    lambda h: h - probe.proj_h2(_to_probe(h)).to(h),
+        "no_statistical": lambda h: h - probe.proj_h1(_to_probe(h)).to(h),
+        "no_icl":         lambda h: h - probe._apply_gate(
+                              probe.delta(_to_probe(h)), probe.p2
+                          ).to(h),
+        "random":         lambda h: h - random_proj(_to_probe(h)).to(h),
+    }
+
+    # --- Storage ---
+    # results[condition][mode] = list of per-sample dicts
+    results: Dict[str, Dict[str, list]] = {
+        cond: {mode: [] for mode in ablation_modes} for cond in CONDITION_KEYS
+    }
+
+    # --- Sample indices ---
+    total = len(dataset)
+    if n_samples is not None and n_samples < total:
+        indices = random.sample(range(total), n_samples)
+    else:
+        indices = list(range(total))
+        n_samples = total
+
+    if logger:
+        logger.info(
+            f"Causal intervention: {n_samples} samples, "
+            f"{len(ablation_modes)} ablation modes, "
+            f"{len(CONDITION_KEYS)} conditions"
+        )
+
+    for step, idx in enumerate(indices):
+        if logger and (step + 1) % 10 == 0:
+            logger.info(f"  Causal intervention: {step + 1}/{n_samples}")
+
+        item = dataset[idx]
+        qid = dataset.qids[idx] if hasattr(dataset, "qids") else str(idx)
+
+        inputs = [
+            item["zsl_rand"],
+            item["zsl_sem"],
+            item["icl_rand"],
+            item["icl_sem"],
+        ]
+
+        # Forward pass -> last-layer hidden states  [4, seq_len, hidden_dim]
+        hidden_all = forward_hidden_states_batch(
+            inputs, llava_model, tokenizer, device
+        )
+
+        for ci, cond in enumerate(CONDITION_KEYS):
+            h_orig = hidden_all[ci : ci + 1]  # [1, seq_len, hidden_dim]
+
+            # Original logits (computed once per condition)
+            logits_orig = _compute_logits(h_orig, llava_model)  # [1, seq, V]
+            log_p_orig = F.log_softmax(logits_orig, dim=-1)
+            ids_orig = logits_orig.argmax(dim=-1)  # [1, seq]
+
+            for mode_name, ablate_fn in ablation_modes.items():
+                h_abl = ablate_fn(h_orig)
+
+                # 1. Cosine similarity (per-token, then averaged)
+                cos = F.cosine_similarity(
+                    h_orig.float(), h_abl.float(), dim=-1
+                )  # [1, seq]
+                cos_mean = cos.mean().item()
+
+                # 2. Token agreement
+                logits_abl = _compute_logits(h_abl, llava_model)
+                ids_abl = logits_abl.argmax(dim=-1)  # [1, seq]
+                agree = (ids_orig == ids_abl).float().mean().item()
+
+                # 3. KL divergence
+                log_p_abl = F.log_softmax(logits_abl, dim=-1)
+                # KL(P_orig || P_abl) per position, then mean
+                kl = F.kl_div(
+                    log_p_abl, log_p_orig.exp(), reduction="none", log_target=False
+                ).sum(dim=-1)  # [1, seq]
+                kl_mean = kl.mean().item()
+
+                results[cond][mode_name].append({
+                    "qid": qid,
+                    "cosine_similarity": cos_mean,
+                    "token_agreement": agree,
+                    "kl_divergence": kl_mean,
+                })
+
+                del h_abl, logits_abl, ids_abl, log_p_abl, kl, cos
+
+            del logits_orig, log_p_orig, ids_orig
+
+        del hidden_all
+        free_memory()
+
+    # ------------------------------------------------------------------
+    # Aggregate & save
+    # ------------------------------------------------------------------
+    agg: Dict[str, Dict[str, Dict[str, float]]] = {}
+    metric_keys = ["cosine_similarity", "token_agreement", "kl_divergence"]
+
+    for cond in CONDITION_KEYS:
+        agg[cond] = {}
+        for mode in ablation_modes:
+            vals = results[cond][mode]
+            entry: Dict[str, float] = {}
+            for mk in metric_keys:
+                arr = np.array([v[mk] for v in vals])
+                entry[f"{mk}_mean"] = float(arr.mean())
+                entry[f"{mk}_std"] = float(arr.std())
+            agg[cond][mode] = entry
+
+    # Per-sample JSON dumps
+    cos_path = os.path.join(save_dir, "cosine_similarity_by_ablation.json")
+    agree_path = os.path.join(save_dir, "token_agreement_by_ablation.json")
+    kl_path = os.path.join(save_dir, "kl_divergence_by_ablation.json")
+
+    for path, mk in [(cos_path, "cosine_similarity"),
+                      (agree_path, "token_agreement"),
+                      (kl_path, "kl_divergence")]:
+        dump: Dict[str, Dict[str, list]] = {}
+        for cond in CONDITION_KEYS:
+            dump[cond] = {}
+            for mode in ablation_modes:
+                dump[cond][mode] = [
+                    {"qid": r["qid"], "value": r[mk]}
+                    for r in results[cond][mode]
+                ]
+        with open(path, "w") as f:
+            json.dump(dump, f, indent=2)
+    if logger:
+        logger.info(f"Saved per-sample metrics to {save_dir}")
+
+    # ------------------------------------------------------------------
+    # Statistical tests  (paired Wilcoxon: each ablation vs "original")
+    # ------------------------------------------------------------------
+    stat_results: Dict[str, Dict[str, Dict[str, dict]]] = {}
+    for cond in CONDITION_KEYS:
+        stat_results[cond] = {}
+        orig_vals = {
+            mk: np.array([r[mk] for r in results[cond]["original"]])
+            for mk in metric_keys
+        }
+        for mode in ablation_modes:
+            if mode == "original":
+                continue
+            stat_results[cond][mode] = {}
+            for mk in metric_keys:
+                abl_vals = np.array([r[mk] for r in results[cond][mode]])
+                diff = abl_vals - orig_vals[mk]
+                # Guard against all-zero differences (Wilcoxon requires nonzero)
+                if np.all(diff == 0):
+                    stat_results[cond][mode][mk] = {
+                        "statistic": 0.0,
+                        "p_value": 1.0,
+                        "note": "all differences zero",
+                    }
+                else:
+                    try:
+                        stat_val, p_val = stats.wilcoxon(diff)
+                        stat_results[cond][mode][mk] = {
+                            "statistic": float(stat_val),
+                            "p_value": float(p_val),
+                        }
+                    except ValueError as e:
+                        stat_results[cond][mode][mk] = {
+                            "statistic": 0.0,
+                            "p_value": 1.0,
+                            "error": str(e),
+                        }
+
+    stat_path = os.path.join(save_dir, "statistical_tests.json")
+    with open(stat_path, "w") as f:
+        json.dump(stat_results, f, indent=2)
+    if logger:
+        logger.info(f"Saved statistical tests to {stat_path}")
+
+    # ------------------------------------------------------------------
+    # Plotly grouped bar chart
+    # ------------------------------------------------------------------
+    _make_causal_summary_chart(agg, CONDITION_KEYS, metric_keys, save_dir, logger)
+
+    if logger:
+        logger.info(f"Causal intervention analysis complete. Results in {save_dir}")
+
+    return results, agg, stat_results
+
+
+def _make_causal_summary_chart(
+    agg: Dict[str, Dict[str, Dict[str, float]]],
+    conditions: list,
+    metric_keys: list,
+    save_dir: str,
+    logger=None,
+):
+    """Create a Plotly grouped bar chart summarising ablation effects."""
+    fig = make_subplots(
+        rows=len(metric_keys), cols=1,
+        subplot_titles=[mk.replace("_", " ").title() for mk in metric_keys],
+        vertical_spacing=0.08,
+    )
+
+    modes = list(agg[conditions[0]].keys())
+    # Build x-axis labels as "condition / mode"
+    for mi, mk in enumerate(metric_keys, start=1):
+        for mode in modes:
+            x_labels = []
+            y_vals = []
+            y_errs = []
+            for cond in conditions:
+                x_labels.append(f"{cond}")
+                y_vals.append(agg[cond][mode][f"{mk}_mean"])
+                y_errs.append(agg[cond][mode][f"{mk}_std"])
+
+            fig.add_trace(
+                go.Bar(
+                    name=mode if mi == 1 else None,
+                    x=x_labels,
+                    y=y_vals,
+                    error_y=dict(type="data", array=y_errs, visible=True),
+                    legendgroup=mode,
+                    showlegend=(mi == 1),
+                ),
+                row=mi, col=1,
+            )
+
+    fig.update_layout(
+        barmode="group",
+        height=350 * len(metric_keys),
+        title_text="Causal Subspace Intervention: Ablation Effects",
+    )
+    chart_path = os.path.join(save_dir, "ablation_summary.html")
+    fig.write_html(chart_path)
+    if logger:
+        logger.info(f"Saved ablation summary chart to {chart_path}")
+
+
+def eval_causal_generation(
+    args: argparse.Namespace,
+    dataset: "QIDDataset",
+    tokenizer: PreTrainedTokenizer,
+    llava_model: LlavaLlamaForCausalLM,
+    image_processor,
+    probe: FourSpaceProjector,
+    device: torch.device,
+    logger=None,
+    n_samples: int = 100,
+):
+    """Generate VQA answers under each ablation mode and evaluate accuracy.
+
+    For the *icl_sem* condition of each sample, run
+    :func:`generate_with_ablation` with each of the five ablation modes
+    (original, no_semantic, no_statistical, no_icl, random).  The resulting
+    answers are written to JSONL files that the existing TextVQA / GQA
+    evaluation scripts can score.  A JSON summary and a Plotly bar chart
+    comparing accuracy across ablation modes are also produced.
+    """
+
+    save_dir = os.path.join(args.exp_dir, "causal_gen")
+    os.makedirs(save_dir, exist_ok=True)
+
+    # --- Build ablation functions (same as eval_causal_intervention) ---
+    probe_dtype = next(probe.parameters()).dtype
+    probe_device = next(probe.parameters()).device
+    random_proj = _make_random_projection(
+        probe.proj_h2.weight, seed=args.seed if hasattr(args, "seed") else 42
+    )
+
+    def _to_probe(h: torch.Tensor) -> torch.Tensor:
+        return h.to(device=probe_device, dtype=probe_dtype)
+
+    ablation_modes = {
+        "original":       lambda h: h,
+        "no_semantic":    lambda h: h - probe.proj_h2(_to_probe(h)).to(h),
+        "no_statistical": lambda h: h - probe.proj_h1(_to_probe(h)).to(h),
+        "no_icl":         lambda h: h - probe._apply_gate(
+                              probe.delta(_to_probe(h)), probe.p2
+                          ).to(h),
+        "random":         lambda h: h - random_proj(_to_probe(h)).to(h),
+    }
+
+    mode_names = list(ablation_modes.keys())
+    model_name = os.path.basename(args.model_path)
+    conv_mode = getattr(args, "conv_mode", "llava_v1")
+    max_new_tokens = getattr(args, "max_new_tokens", 128)
+
+    # --- Open JSONL writers ---
+    writers = {}
+    file_handles = {}
+    for mode in mode_names:
+        fname = f"answers_ablated_{mode}_{model_name}.jsonl"
+        fpath = os.path.join(save_dir, fname)
+        fh = open(fpath, "w")
+        file_handles[mode] = fh
+        writers[mode] = fpath
+    if logger:
+        logger.info(f"Causal generation: {n_samples} samples, {len(mode_names)} modes")
+
+    actual_n = min(n_samples, len(dataset))
+
+    try:
+        for i in range(actual_n):
+            item = dataset[i]
+            qid = dataset.qids[i]
+            cond_data = item["icl_sem"]
+            input_ids = cond_data["input_ids"].unsqueeze(0)  # [1, seq_len]
+            images = cond_data["image"]  # already processed tensor
+
+            for mode in mode_names:
+                ablate_fn = ablation_modes[mode]
+                answer_text = generate_with_ablation(
+                    llava_model,
+                    tokenizer,
+                    input_ids,
+                    images,
+                    ablate_fn,
+                    max_new_tokens=max_new_tokens,
+                    temperature=0.0,
+                    prefill_only=True,
+                    conv_mode=conv_mode,
+                )
+                ans_dict = {
+                    "question_id": qid,
+                    "prompt": dataset.qid_texts.get(qid, ""),
+                    "text": answer_text,
+                    "answer_id": shortuuid.uuid(),
+                    "model_id": model_name,
+                    "metadata": {"ablation": mode},
+                }
+                file_handles[mode].write(json.dumps(ans_dict) + "\n")
+
+            if logger and (i + 1) % 10 == 0:
+                logger.info(f"  Causal generation: {i + 1}/{actual_n} samples done")
+    finally:
+        for fh in file_handles.values():
+            fh.close()
+
+    if logger:
+        logger.info(f"Saved {len(mode_names)} answer JSONL files to {save_dir}")
+
+    # --- Run evaluation on each JSONL ---
+    task = getattr(args, "task", "textvqa")
+    accuracies = {}
+
+    for mode in mode_names:
+        jsonl_path = writers[mode]
+        try:
+            if task == "textvqa":
+                accuracies[mode] = _eval_textvqa_jsonl(args, jsonl_path, logger)
+            elif task == "gqa":
+                accuracies[mode] = _eval_gqa_jsonl(args, jsonl_path, logger)
+            else:
+                if logger:
+                    logger.warning(f"No eval support for task '{task}'; skipping.")
+                accuracies[mode] = None
+        except Exception as e:
+            if logger:
+                logger.warning(f"Evaluation failed for {mode}: {e}")
+            accuracies[mode] = None
+
+    # --- Save accuracy summary ---
+    summary_path = os.path.join(save_dir, "vqa_accuracy_by_ablation.json")
+    with open(summary_path, "w") as f:
+        json.dump(accuracies, f, indent=2)
+    if logger:
+        logger.info(f"Accuracy summary: {json.dumps(accuracies, indent=2)}")
+        logger.info(f"Saved accuracy summary to {summary_path}")
+
+    # --- Plotly bar chart ---
+    _make_causal_gen_chart(accuracies, save_dir, logger)
+
+    return accuracies
+
+
+def _eval_textvqa_jsonl(args, jsonl_path, logger=None):
+    """Evaluate a TextVQA answer JSONL using the annotation file.
+
+    The TextVQA annotation maps ``(image_id, question.lower())`` to each
+    entry.  In the LLaVA evaluation JSONL the ``question_id`` field carries the
+    TextVQA ``image_id`` (not the annotation ``question_id``), and the raw
+    question text is embedded inside ``prompt``.  We therefore follow the same
+    lookup strategy used by the official ``eval_textvqa.py``, including proper
+    answer normalisation via ``TextVQAAccuracyEvaluator``.
+    """
+    from llava.eval.m4c_evaluator import TextVQAAccuracyEvaluator
+
+    annotation_path = os.path.join(
+        args.data_dir, "TextVQA_0.5.1_val.json"
+    )
+    if not os.path.exists(annotation_path):
+        if logger:
+            logger.warning(f"TextVQA annotation not found: {annotation_path}")
+        return None
+
+    with open(annotation_path, "r") as f:
+        annotations = json.load(f)["data"]
+    # Key by (image_id, question_lower) – same as official eval_textvqa.py
+    annotation_map = {
+        (str(a["image_id"]), a["question"].lower()): a for a in annotations
+    }
+
+    with open(jsonl_path, "r") as f:
+        predictions = [json.loads(line) for line in f]
+
+    evaluator = TextVQAAccuracyEvaluator()
+    pred_list = []
+    for pred in predictions:
+        qid = str(pred["question_id"])
+        prompt = pred.get("prompt", "")
+        # Extract question text from prompt (same logic as qid_prompt_processor)
+        question = _extract_question_from_prompt(prompt)
+        if question is None:
+            if logger:
+                logger.debug(f"Could not extract question from prompt for qid {qid}")
+            continue
+        key = (qid, question.lower())
+        if key not in annotation_map:
+            continue
+        ann = annotation_map[key]
+        pred_list.append({
+            "pred_answer": pred["text"],
+            "gt_answers": ann["answers"],
+        })
+
+    if not pred_list:
+        if logger:
+            logger.info(f"TextVQA accuracy for {os.path.basename(jsonl_path)}: "
+                         f"0.00% (0 samples)")
+        return 0.0
+
+    accuracy = evaluator.eval_pred_list(pred_list) * 100
+    if logger:
+        logger.info(f"TextVQA accuracy for {os.path.basename(jsonl_path)}: "
+                     f"{accuracy:.2f}% ({len(pred_list)} samples)")
+    return accuracy
+
+
+def _extract_question_from_prompt(prompt: str) -> Optional[str]:
+    """Extract the raw question text from a TextVQA prompt string.
+
+    Mirrors the extraction logic in ``eval_textvqa.qid_prompt_processor``.
+    Returns ``None`` if the format is unrecognised.
+    """
+    if not prompt:
+        return None
+    if prompt.startswith("OCR tokens: "):
+        m = re.search(r"Question: (.*?) Short answer:", prompt, re.DOTALL)
+        return m.group(1) if m else None
+    if "Reference OCR token: " in prompt and len(prompt.split("\n")) == 3:
+        if prompt.startswith("Reference OCR token:"):
+            return prompt.split("\n")[1]
+        return prompt.split("\n")[0]
+    parts = prompt.split("\n")
+    if len(parts) == 2:
+        return parts[0]
+    return None
+
+
+def _eval_gqa_jsonl(args, jsonl_path, logger=None):
+    """Evaluate a GQA answer JSONL using the questions file."""
+    questions_path = os.path.join(args.data_dir, "testdev_balanced_questions.json")
+    if not os.path.exists(questions_path):
+        # Try alternative path
+        questions_path = os.path.join(args.data_dir, "val_balanced_questions.json")
+    if not os.path.exists(questions_path):
+        if logger:
+            logger.warning(f"GQA questions file not found in {args.data_dir}")
+        return None
+
+    with open(questions_path, "r") as f:
+        questions = json.load(f)
+
+    with open(jsonl_path, "r") as f:
+        predictions = [json.loads(line) for line in f]
+
+    correct = 0
+    total = 0
+    for pred in predictions:
+        qid = str(pred["question_id"])
+        if qid not in questions:
+            continue
+        gt_answer = questions[qid]["answer"].strip().lower()
+        pred_answer = pred["text"].strip().lower()
+        if pred_answer == gt_answer:
+            correct += 1
+        total += 1
+
+    accuracy = (correct / total * 100) if total > 0 else 0.0
+    if logger:
+        logger.info(f"GQA accuracy for {os.path.basename(jsonl_path)}: "
+                     f"{accuracy:.2f}% ({total} samples)")
+    return accuracy
+
+
+def _make_causal_gen_chart(
+    accuracies: Dict[str, Optional[float]],
+    save_dir: str,
+    logger=None,
+):
+    """Create a Plotly bar chart comparing VQA accuracy across ablation modes."""
+    modes = []
+    accs = []
+    for mode, acc in accuracies.items():
+        if acc is not None:
+            modes.append(mode)
+            accs.append(acc)
+
+    if not modes:
+        if logger:
+            logger.warning("No valid accuracies to plot for causal generation chart")
+        return
+
+    colors = {
+        "original": "#636EFA",
+        "no_semantic": "#EF553B",
+        "no_statistical": "#00CC96",
+        "no_icl": "#AB63FA",
+        "random": "#FFA15A",
+    }
+
+    fig = go.Figure(data=[
+        go.Bar(
+            x=modes,
+            y=accs,
+            marker_color=[colors.get(m, "#999999") for m in modes],
+            text=[f"{a:.1f}%" for a in accs],
+            textposition="auto",
+        )
+    ])
+    fig.update_layout(
+        title="Causal Generation: VQA Accuracy by Ablation Mode",
+        xaxis_title="Ablation Mode",
+        yaxis_title="Accuracy (%)",
+        height=450,
+    )
+    chart_path = os.path.join(save_dir, "accuracy_comparison.html")
+    fig.write_html(chart_path)
+    if logger:
+        logger.info(f"Saved accuracy comparison chart to {chart_path}")
+
+
+# ---------------------------------------------------------------------------
+# Dispatcher
+# ---------------------------------------------------------------------------
+
 def eval(
     args: argparse.Namespace,
     dataset: QIDDataset,
@@ -2988,28 +3773,60 @@ def eval(
     probe: FourSpaceProjector,
     device: torch.device,
     logger=None,
+    image_processor=None,
 ):
     """Run both local and global evaluations."""
-    eval_local(
-        args,
-        dataset,
-        tokenizer,
-        llava_model,
-        probe,
-        device,
-        logger,
-    )
-    logger.info("Local evaluation completed.")
-    eval_global(
-        args,
-        dataset,
-        tokenizer,
-        llava_model,
-        probe,
-        device,
-        logger,
-    )
-    logger.info("Global evaluation completed.")
+    causal_only = getattr(args, "causal_only", False)
+    causal_gen = getattr(args, "causal_gen", False)
+
+    if not causal_only and not causal_gen:
+        eval_local(
+            args,
+            dataset,
+            tokenizer,
+            llava_model,
+            probe,
+            device,
+            logger,
+        )
+        logger.info("Local evaluation completed.")
+        eval_global(
+            args,
+            dataset,
+            tokenizer,
+            llava_model,
+            probe,
+            device,
+            logger,
+        )
+        logger.info("Global evaluation completed.")
+
+    if causal_only or getattr(args, "run_causal", False):
+        eval_causal_intervention(
+            args,
+            dataset,
+            tokenizer,
+            llava_model,
+            probe,
+            device,
+            logger,
+            n_samples=getattr(args, "causal_n_samples", 100),
+        )
+        logger.info("Causal intervention evaluation completed.")
+
+    if causal_gen:
+        eval_causal_generation(
+            args,
+            dataset,
+            tokenizer,
+            llava_model,
+            image_processor,
+            probe,
+            device,
+            logger,
+            n_samples=getattr(args, "causal_gen_n_samples", 100),
+        )
+        logger.info("Causal generation evaluation completed.")
 
 
 def fix_seeds(seed: int):
@@ -3035,21 +3852,39 @@ def main():
     )
     parser.add_argument(
         "--model-dir",
-        required=True,
+        default=None,
         help="Path to directory containing mixed and random models",
     )
     parser.add_argument(
         "--data-dir",
-        required=True,
-        help="Path to directory containing embeddings (.pt.gz)",
+        default=None,
+        help="Path to directory containing dataset annotation files",
     )
     parser.add_argument(
-        "--tags", required=True, help="Comma-separated tags for models (ts1,ts2,ts3)"
+        "--tags", default=None, help="Comma-separated tags for models (ts1,ts2,ts3)"
     )
     parser.add_argument(
         "--model2",
-        required=True,
+        default=None,
         help="Second model identifier used in trained model name",
+    )
+    parser.add_argument(
+        "--preextracted-dir",
+        default=None,
+        help="Path to directory containing pre-extracted four_proj_*.pt.gz files "
+             "(from Phase 2 with --extract-control-conditions). When set, training "
+             "loads saved states instead of running forward passes through LLaVA.",
+    )
+    parser.add_argument(
+        "--task",
+        default="textvqa",
+        choices=["textvqa", "gqa"],
+        help="Dataset/task name (replaces hardcoded 'textvqa')",
+    )
+    parser.add_argument(
+        "--train-only",
+        action="store_true",
+        help="Train the FourSpaceProjector and exit without running evaluation",
     )
     parser.add_argument(
         "--prefix", default="multiple_inputs_", help="Model prefix used in file names"
@@ -3139,63 +3974,134 @@ def main():
         action="store_true",
         help="Also perform ablation with randomly selected words (same count as specified words) for comparison",
     )
+    # Causal subspace intervention arguments
+    parser.add_argument(
+        "--causal-only",
+        action="store_true",
+        help="Run only the causal subspace intervention analysis (skip local/global eval)",
+    )
+    parser.add_argument(
+        "--run-causal",
+        action="store_true",
+        help="Run causal subspace intervention analysis after local/global eval",
+    )
+    parser.add_argument(
+        "--causal-n-samples",
+        type=int,
+        default=100,
+        help="Number of samples for causal intervention analysis",
+    )
+    # Causal generation arguments
+    parser.add_argument(
+        "--causal-gen",
+        action="store_true",
+        help="Run causal generation: produce VQA answers under each ablation mode and evaluate accuracy",
+    )
+    parser.add_argument(
+        "--causal-gen-n-samples",
+        type=int,
+        default=100,
+        help="Number of samples for causal generation analysis",
+    )
     args = parser.parse_args()
+
+    # --causal-only implies --eval-only (need a trained projector)
+    if args.causal_only:
+        args.eval_only = True
+    # --causal-gen implies --eval-only (need a trained projector)
+    if args.causal_gen:
+        args.eval_only = True
 
     logger = get_module_logger()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     fix_seeds(args.seed)
 
-    task = "textvqa"
-    qids, qid_texts, iid_texts, qid_images, iid_images, answers = load_dataset_entries(
-        dataset=task,
-        data_dir=args.data_dir.split(f"/{task}")[0],
-        llava_dir=args.data_dir.split("/playground")[0],
-        prefix=args.prefix,
-        target_qids=None,
-        sample_n=None,
-    )
-    logger.info(f"Loaded {len(qids)} questions")
+    task = args.task
+    preextracted_dir = getattr(args, "preextracted_dir", None)
+    train_only = getattr(args, "train_only", False)
 
-    tokenizer, llava_model, image_processor, _ = build_llava_model(args, device)
-    if device.type == "cpu":
-        llava_model = llava_model.to(torch.float32)
-    llava_model.eval()
-    logger.info("Model loaded and ready for evaluation")
+    # --- Training phase ---
+    if preextracted_dir is not None and not args.eval_only:
+        # Pre-extracted mode: train without loading model or dataset
+        logger.info(f"Training from pre-extracted states in {preextracted_dir}")
+        probe = train(args, device=device, logger=logger)
+        logger.info("Training complete")
+        if train_only:
+            logger.info("Train-only mode: skipping evaluation")
+            return
+    elif not args.eval_only:
+        # Original mode: load dataset and model, then train
+        if args.data_dir is None:
+            raise ValueError("--data-dir is required when --preextracted-dir is not set")
+        qids, qid_texts, iid_texts, qid_images, iid_images, answers = load_dataset_entries(
+            dataset=task,
+            data_dir=args.data_dir.split(f"/{task}")[0],
+            llava_dir=args.data_dir.split("/playground")[0],
+            prefix=args.prefix,
+            target_qids=None,
+            sample_n=None,
+        )
+        logger.info(f"Loaded {len(qids)} questions")
 
-    dataset = QIDDataset(
-        qids,
-        qid_texts,
-        iid_texts,
-        qid_images,
-        iid_images,
-        answers,
-        args,
-        tokenizer,
-        image_processor,
-        llava_model.config,
-    )
+        tokenizer, llava_model, image_processor, _ = build_llava_model(args, device)
+        if device.type == "cpu":
+            llava_model = llava_model.to(torch.float32)
+        llava_model.eval()
+        logger.info("Model loaded and ready for evaluation")
 
-    if args.eval_only:
-        logger.info("Evaluation-only mode: loading trained probe from disk")
+        dataset = QIDDataset(
+            qids, qid_texts, iid_texts, qid_images, iid_images, answers,
+            args, tokenizer, image_processor, llava_model.config,
+        )
+        probe = train(args, dataset, tokenizer, llava_model, device, logger)
+        logger.info("Training complete")
+        if train_only:
+            logger.info("Train-only mode: skipping evaluation")
+            return
+
+    # --- Evaluation phase ---
+    # Load model/dataset if not already loaded (eval-only or pre-extracted training)
+    if args.eval_only or preextracted_dir is not None:
+        if args.eval_only:
+            logger.info("Evaluation-only mode: loading trained probe from disk")
+        else:
+            logger.info("Loading model for evaluation after pre-extracted training")
         config = CustomModelConfig()
-        probe = FourSpaceProjector(
+        probe_obj = FourSpaceProjector(
             hidden_size=config.embed_dim,
             bias=True,
             gate="scalar",
             init="xavier_uniform",
         ).to(device)
         probe_path = os.path.join(args.exp_dir, "four_space_projector.pt")
-        probe.load_state_dict(torch.load(probe_path, map_location=device))
-    else:
-        probe = train(
-            args,
-            dataset,
-            tokenizer,
-            llava_model,
-            device,
-            logger,
+        probe_obj.load_state_dict(torch.load(probe_path, map_location=device))
+        if args.eval_only:
+            probe = probe_obj
+
+        if args.data_dir is None:
+            raise ValueError("--data-dir is required for evaluation")
+        qids, qid_texts, iid_texts, qid_images, iid_images, answers = load_dataset_entries(
+            dataset=task,
+            data_dir=args.data_dir.split(f"/{task}")[0],
+            llava_dir=args.data_dir.split("/playground")[0],
+            prefix=args.prefix,
+            target_qids=None,
+            sample_n=None,
         )
-        logger.info("Training complete")
+        logger.info(f"Loaded {len(qids)} questions for evaluation")
+
+        tokenizer, llava_model, image_processor, _ = build_llava_model(args, device)
+        if device.type == "cpu":
+            llava_model = llava_model.to(torch.float32)
+        llava_model.eval()
+        logger.info("Model loaded for evaluation")
+
+        dataset = QIDDataset(
+            qids, qid_texts, iid_texts, qid_images, iid_images, answers,
+            args, tokenizer, image_processor, llava_model.config,
+        )
+        if preextracted_dir is not None:
+            probe = probe_obj
 
     eval(
         args,
@@ -3205,6 +4111,7 @@ def main():
         probe,
         device,
         logger,
+        image_processor=image_processor,
     )
     logger.info("Evaluation complete")
 
